@@ -21,7 +21,7 @@ Based on the enterprise best practices from Derek Seaman's storage guides.
 ## 🛠️ Prerequisites
 
 Before executing the script, ensure you have:
-1. A fresh or existing installation of **Proxmox Backup Server** (Root access required).
+1. A fresh or existing installation of **Proxmox Backup Server** (Root access required and OBS NO LXC - MUST BE DEDICATED VM)
 2. A configured **LUN and iSCSI Target** inside your Synology **SAN Manager**.
 3. **CHAP Authentication** credentials configured on your NAS target (12-16 characters recommended).
 4. Network permissions/masking on the Synology mapping access to this PBS server's Initiator Name.
