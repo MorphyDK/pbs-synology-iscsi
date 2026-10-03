@@ -46,7 +46,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/MorphyDK/pbs-synology-iscsi/
 
 <img width="559" height="302" alt="ISCSI2" src="https://github.com/user-attachments/assets/bad544d3-cb31-485b-b6f4-5c58c8d03a56" />
 
+<img width="556" height="651" alt="Lun setup" src="https://github.com/user-attachments/assets/2cf7a386-b14c-4bb1-bba8-aaff1c438e28" />
 
+<img width="965" height="650" alt="setup done" src="https://github.com/user-attachments/assets/4c170b02-d217-4d62-ae63-958b12b3f903" />
 
 ---
 
