@@ -50,6 +50,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/MorphyDK/pbs-synology-iscsi/
 
 <img width="965" height="650" alt="setup done" src="https://github.com/user-attachments/assets/4c170b02-d217-4d62-ae63-958b12b3f903" />
 
+<img width="1613" height="608" alt="ProxmoxPBS" src="https://github.com/user-attachments/assets/617ba011-9193-439c-b47d-7b02470aca24" />
+
+
 ---
 
 ## 📸 How It Works (Stepper Architecture)
