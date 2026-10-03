@@ -2,7 +2,7 @@
 
 A safe, interactive, and fully automated **post-install script for Proxmox Backup Server (PBS)** designed to optimize your system and seamlessly mount high-performance **Synology iSCSI LUNs** for backup storage.
 
-Based on the enterprise best practices from Derek Seaman's storage guides.
+Based on the enterprise best practices from Derek Seaman's storage guides. Thanks Derek :)
 
 ---
 
