@@ -33,7 +33,7 @@ Before executing the script, ensure you have:
 Run the following command directly on your Proxmox Backup Server as `root`:
 
 ```bash
-bash <(curl -sSL https://raw.githubusercontent.com/MorphyDK/pbs-synology-iscsi/refs/heads/main/pbs-post-install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/MorphyDK/pbs-synology-iscsi/refs/heads/main/pbs-post-install.sh)
 ```
 
 > [!NOTE]
