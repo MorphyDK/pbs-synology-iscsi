@@ -16,6 +16,8 @@ Based on the enterprise best practices from Derek Seaman's storage guides.
 *   **Storage Optimization:** Forces automated weekly `fstrim` routines to pass deleted backup blocks back to your Synology (Thin Provisioning space reclamation).
 *   **Web UI Quality of Life:** Disables the persistent "No valid subscription" login popup. This patch survives future system updates automatically.
 
+<img width="532" height="442" alt="Screeny" src="https://github.com/user-attachments/assets/c32f843e-d814-4bc0-b693-c5c7d8c20b2a" />
+
 ---
 
 ## 🛠️ Prerequisites
