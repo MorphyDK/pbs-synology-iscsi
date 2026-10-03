@@ -5,7 +5,9 @@
 # Safe PBS post-install script with iSCSI setup, so you can back up via iSCSI
 # to your Synology NAS.
 # 
-# Version 1.0  10/3-2026
+# Thanks to Derek Seaman's Tech Blog who inspired me to make this.
+#
+# Version 1.4  10/3-2026
 # Author MorphyDK
 
 set -eE
