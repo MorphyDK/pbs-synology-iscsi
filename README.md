@@ -16,8 +16,6 @@ Based on the enterprise best practices from Derek Seaman's storage guides.
 *   **Storage Optimization:** Forces automated weekly `fstrim` routines to pass deleted backup blocks back to your Synology (Thin Provisioning space reclamation).
 *   **Web UI Quality of Life:** Disables the persistent "No valid subscription" login popup. This patch survives future system updates automatically.
 
-<img width="532" height="442" alt="Screeny" src="https://github.com/user-attachments/assets/c32f843e-d814-4bc0-b693-c5c7d8c20b2a" />
-
 ---
 
 ## 🛠️ Prerequisites
@@ -40,6 +38,15 @@ bash <(curl -fsSL https://raw.githubusercontent.com/MorphyDK/pbs-synology-iscsi/
 
 > [!NOTE]
 > **Safety First:** The script is completely interactive. It gathers your settings, tests connections, and inspects your hardware **before writing any data** or formatting any disks. You can abort at any point during the questionnaire without changing your system.
+<img width="532" height="442" alt="Screeny" src="https://github.com/user-attachments/assets/c32f843e-d814-4bc0-b693-c5c7d8c20b2a" />
+
+<img width="535" height="454" alt="Guide info" src="https://github.com/user-attachments/assets/471b454b-4013-4218-8bd2-be03c11c2d79" />
+
+<img width="589" height="167" alt="Connection" src="https://github.com/user-attachments/assets/ee873bf1-8ae9-4248-a6d0-538bdcdd1d21" />
+
+<img width="559" height="302" alt="ISCSI2" src="https://github.com/user-attachments/assets/bad544d3-cb31-485b-b6f4-5c58c8d03a56" />
+
+
 
 ---
 
