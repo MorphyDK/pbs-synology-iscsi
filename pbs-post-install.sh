@@ -7,13 +7,17 @@
 # 
 # Thanks to Derek Seaman's Tech Blog who inspired me to make this.
 #
-# Version 1.4  10/3-2026
+# Version 1.5  18/10-2026
 # Author MorphyDK
+#
+# Changes in 1.5:
+#  - Re-running on an already mounted LUN now corrects an outdated /etc/fstab line
+#  - The iSCSI monitor uses timeouts, so a hanging login/mount can't block it
 
 set -eE
 export LC_ALL=C.UTF-8
 
-VERSION="1.4"
+VERSION="1.5"
 LOG_FILE="/var/log/pbs-post-install.log"
 FS_LABEL="pbs-data"
 FOUR_TIB=4398046511104
@@ -1712,21 +1716,30 @@ step_disk() {
 }
 
 step_mount() {
-    local unit unit_name tmp_fstab service_name
+    local unit unit_name tmp_fstab service_name current
     begin_step $S_MOUNT
     FSTAB_ENTRY="UUID=${UUID} ${MOUNT_PATH} ${FS_TYPE} defaults,_netdev,nofail,x-systemd.device-timeout=30 0 0"
 
     if [[ "$DISK_ACTION" == "mounted" ]]; then
-        if awk -v p="$MOUNT_PATH" '!/^[[:space:]]*#/ && $2 == p { f = 1 } END { exit !f }' /etc/fstab; then
-            ok "Already mounted and listed in /etc/fstab"
-            FSTAB_ENTRY=$(awk -v p="$MOUNT_PATH" '!/^[[:space:]]*#/ && $2 == p' /etc/fstab | head -n 1)
+        # v1.5: also correct an existing line written by an older version
+        current=$(awk -v p="$MOUNT_PATH" '!/^[[:space:]]*#/ && $2 == p' /etc/fstab | head -n 1)
+        if [[ "$current" == "$FSTAB_ENTRY" ]]; then
+            ok "Already mounted and /etc/fstab is correct"
         else
             cp /etc/fstab "/etc/fstab.backup.$(date +%Y%m%d-%H%M%S)"
+            tmp_fstab=$(mktemp)
+            awk -v p="$MOUNT_PATH" '/^[[:space:]]*#/ || $2 != p' /etc/fstab > "$tmp_fstab"
+            cat "$tmp_fstab" > /etc/fstab
+            rm -f "$tmp_fstab"
             echo "$FSTAB_ENTRY" >> /etc/fstab
             systemctl daemon-reload
-            ok "Added the missing /etc/fstab entry (backup saved)"
+            if [[ -n "$current" ]]; then
+                ok "Updated the /etc/fstab entry to the current format (backup saved)"
+            else
+                ok "Added the missing /etc/fstab entry (backup saved)"
+            fi
         fi
-        finish_step $S_MOUNT "$MOUNT_PATH (unchanged)"
+        finish_step $S_MOUNT "$MOUNT_PATH (already mounted)"
         return 0
     fi
 
@@ -1798,7 +1811,8 @@ log_message() {
 check_and_restore_mount() {
     if ! mountpoint -q "$MOUNT_PATH" 2>/dev/null; then
         log_message "Mount point $MOUNT_PATH not mounted. Attempting to mount..."
-        if mount "$MOUNT_PATH" 2>/dev/null; then
+        # Timeout so a hanging mount can never block the monitor
+        if timeout 60 mount "$MOUNT_PATH" 2>/dev/null; then
             log_message "Successfully mounted $MOUNT_PATH"
         else
             log_message "Failed to mount $MOUNT_PATH"
@@ -1809,7 +1823,8 @@ check_and_restore_mount() {
 # Exact IQN match (field 4 of "iscsiadm -m session")
 if ! iscsiadm -m session 2>/dev/null | awk -v t="$TARGET" '$4 == t { f = 1 } END { exit !f }'; then
     log_message "iSCSI session for $TARGET not found. Attempting to reconnect..."
-    if iscsiadm -m node -T "$TARGET" -p "$PORTAL" --login 2>/dev/null; then
+    # Timeout so a login to an unreachable Synology can never block the monitor
+    if timeout 30 iscsiadm -m node -T "$TARGET" -p "$PORTAL" --login 2>/dev/null; then
         log_message "Successfully reconnected to $TARGET"
         sleep 2
         check_and_restore_mount
