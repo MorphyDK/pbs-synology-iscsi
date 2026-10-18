@@ -1016,7 +1016,8 @@ setup_tools() {
     INITIATOR_IQN=$(awk -F= '/^InitiatorName=/ {print $2}' /etc/iscsi/initiatorname.iscsi 2>/dev/null || true)
     echo
     ok "This server's initiator name: ${WHITE}${INITIATOR_IQN:-unknown}${NC}"
-    sleep 2
+    echo
+    press_enter
 }
 
 guide_page_lun() {
