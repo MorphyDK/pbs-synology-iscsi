@@ -7,7 +7,7 @@
 # 
 # Thanks to Derek Seaman's Tech Blog who inspired me to make this.
 #
-# Version 1.7.4  20/10-2026
+# Version 1.7.5  20/10-2026
 # Author MorphyDK
 #
 # Usage:  ./pbs-post-install.sh              interactive installer
@@ -16,6 +16,11 @@
 #         ./pbs-post-install.sh --motd       install / update only the login screen
 #         ./pbs-post-install.sh --motd-remove  remove the login screen again
 #         ./pbs-post-install.sh --help
+#
+# Changes in 1.7.5:
+#  - Timers (the "Elapsed" line, the spinner, the final "completed in") use a monotonic clock.
+#    Before, a clock correction by time sync in the middle of the install (common in VMs)
+#    made them jump by minutes or hours
 #
 # Changes in 1.7.4:
 #  - --status: a normal reconnect after a reboot no longer counts as a "problem event"
@@ -76,7 +81,7 @@
 set -eE
 export LC_ALL=C.UTF-8
 
-VERSION="1.7.4"
+VERSION="1.7.5"
 LOG_FILE="/var/log/pbs-post-install.log"
 FS_LABEL="pbs-data"
 FOUR_TIB=4398046511104
@@ -251,6 +256,15 @@ term_rows() {
     echo "$r"
 }
 
+# Seconds from a monotonic clock (/proc/uptime). Bash's own $SECONDS follows the wall
+# clock, so it jumps when time sync corrects the clock of a VM in the middle of the install.
+MONO=0
+mono() {
+    local u
+    read -r u _ < /proc/uptime || u=0
+    MONO=${u%.*}
+}
+
 trunc() {
     local s="$1" w="$2"
     if (( w < 4 )); then w=4; fi
@@ -351,7 +365,8 @@ render_screen() {
     render_header
     echo
     draw_bar
-    el=$(( SECONDS - INSTALL_START ))
+    mono
+    el=$(( MONO - INSTALL_START ))
     printf '  %sElapsed %02d:%02d%s\n\n' "$DIM" $(( el / 60 )) $(( el % 60 )) "$NC"
     for (( i = 0; i < TOTAL_STEPS; i++ )); do
         case "${STEP_STATUS[i]}" in
@@ -639,10 +654,11 @@ confirm_erase() {
 _run_with_spinner() {
     local desc="$1"
     shift
-    local frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏) i=0 start=$SECONDS el
-    local sz last_sz=-1 last_change=$SECONDS last_line="" stall cols room extra="" colour
+    local frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏) i=0 start el
+    local sz last_sz=-1 last_change last_line="" stall cols room extra="" colour
     { echo; echo "=== $(date '+%F %T')  $desc"; } >> "$LOG_FILE"
     hide_cursor
+    mono; start=$MONO; last_change=$MONO
     "$@" </dev/null >> "$LOG_FILE" 2>&1 &
     BG_PID=$!
     cols=$(term_cols)
@@ -652,12 +668,13 @@ _run_with_spinner() {
             sz=$(stat -c %s "$LOG_FILE" 2>/dev/null || echo 0)
             if [[ "$sz" != "$last_sz" ]]; then
                 last_sz=$sz
-                last_change=$SECONDS
+                last_change=$MONO
                 last_line=$(tail -n 1 "$LOG_FILE" 2>/dev/null | tr -cd '[:print:]' | sed 's/^[[:space:]]*//')
             fi
         fi
-        el=$(( SECONDS - start ))
-        stall=$(( SECONDS - last_change ))
+        mono
+        el=$(( MONO - start ))
+        stall=$(( MONO - last_change ))
         room=$(( cols - ${#desc} - 18 ))
         extra=""
         colour="$DIM"
@@ -684,7 +701,8 @@ _run_with_spinner() {
     printf '\r\033[K'
     show_cursor
     if [[ $RUN_RC -eq 0 ]]; then
-        el=$(( SECONDS - start ))
+        mono
+        el=$(( MONO - start ))
         printf '  %s✔%s %s %s(%02d:%02d)%s\n' "$GREEN" "$NC" "$desc" "$DIM" $(( el / 60 )) $(( el % 60 )) "$NC"
     fi
 }
@@ -3718,7 +3736,8 @@ step_finish() {
             failed=1
         fi
     done
-    el=$(( SECONDS - INSTALL_START ))
+    mono
+    el=$(( MONO - INSTALL_START ))
     if [[ $failed -eq 1 ]]; then
         echo "  ${YELLOW}⚠  Finished with problems - see the red step above and ${LOG_FILE}${NC}"
     else
@@ -3791,7 +3810,8 @@ step_finish() {
 run_install() {
     PHASE="install"
     INSTALL_STARTED=1
-    INSTALL_START=$SECONDS
+    mono
+    INSTALL_START=$MONO
     prune_other_nodes
     echo "=== Installation started $(date '+%F %T')" >> "$LOG_FILE"
 
