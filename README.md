@@ -136,6 +136,16 @@ The dashboard is read when you log in, so the free space and connection state ar
 > Run it as **root**, in a terminal, on the Proxmox Backup Server. A window of 80×30 or larger looks best.
 
 ```bash
+# Via GIT
+apt update
+apt install -y git
+git clone https://github.com/MorphyDK/pbs-synology-iscsi.git
+cd pbs-synology-iscsichmod +x pbs-post-install.sh
+./pbs-post-install.sh --version     # check it says the version you expect
+./pbs-post-install.sh               # run the installer
+
+Script download
+
 # 1. get the script
 wget https://raw.githubusercontent.com/MorphyDK/pbs-synology-iscsi/main/pbs-post-install.sh
 
