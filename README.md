@@ -1,101 +1,505 @@
-# Proxmox Backup Server Post-Install & Synology iSCSI Setup
+<div align="center">
 
-A safe, interactive, and fully automated **post-install script for Proxmox Backup Server (PBS)** designed to optimize your system and seamlessly mount high-performance **Synology iSCSI LUNs** for backup storage.
-
-Based on the enterprise best practices from Derek Seaman's storage guides. Thanks Derek :)
-
-**Current version: 1.5** — see the [Changelog](#-changelog).
-
----
-
-## 🚀 Key Features
-
-*   **Repository Optimization:** Automatically disables the paid enterprise repositories and configures the official, free `pbs-no-subscription` repository (using secure deb822 API format).
-*   **System Upgrades:** Performs a clean, unattended `apt full-upgrade` to patch your kernel and PBS core utilities.
-*   **Guided iSCSI Configuration:** Interactive step-by-step assistant to map, verify, and authenticate with your Synology SAN Manager using CHAP.
-*   **Smart LUN Inspection:** Scans targeted disks *before* touching them. If an existing PBS datastore is found, it safely re-attaches it without losing a single block of data.
-*   **Resilient Mounting:** Sets up a network-aware `/etc/fstab` entry (`_netdev`, `nofail`, no boot-time fsck) paired with an **automatic 1-minute cron monitor** that transparently reconnects the iSCSI session and restores the mount if the network drops or the NAS reboots. Logins and mounts have timeouts, so an unreachable NAS can never stall the monitor.
-*   **Local Disk Protection:** The empty mount directory is made immutable, so PBS can never write backups to the system disk if the LUN is missing.
-*   **Storage Optimization:** Forces automated weekly `fstrim` routines to pass deleted backup blocks back to your Synology (Thin Provisioning space reclamation).
-*   **Web UI Quality of Life:** Disables the persistent "No valid subscription" login popup. This patch survives future system updates automatically.
-
----
-
-## 🛠️ Prerequisites
-
-Before executing the script, ensure you have:
-1. A fresh or existing installation of **Proxmox Backup Server** with root access. **PBS must run as a dedicated VM — not in an LXC container** (iSCSI does not work inside LXC).
-2. A configured **LUN and iSCSI Target** inside your Synology **SAN Manager**.
-3. **CHAP Authentication** credentials configured on your NAS target (12-16 characters recommended).
-4. Network permissions/masking on the Synology mapping access to this PBS server's Initiator Name.
-
----
-
-## 💻 Quick Start
-
-Run the following command directly on your Proxmox Backup Server as `root`:
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/MorphyDK/pbs-synology-iscsi/refs/heads/main/pbs-post-install.sh)
+```
+ ██████╗ ██████╗ ███████╗
+ ██╔══██╗██╔══██╗██╔════╝
+ ██████╔╝██████╔╝███████╗
+ ██╔═══╝ ██╔══██╗╚════██║
+ ██║     ██████╔╝███████║
+ ╚═╝     ╚═════╝ ╚══════╝
 ```
 
-> [!NOTE]
-> **Safety First:** The script is completely interactive. It gathers your settings, tests connections, and inspects your hardware **before writing any data** or formatting any disks. You can abort at any point during the questionnaire without changing your system.
-<img width="532" height="442" alt="Screeny" src="https://github.com/user-attachments/assets/c32f843e-d814-4bc0-b693-c5c7d8c20b2a" />
+# PBS Post-Install
 
-<img width="535" height="454" alt="Guide info" src="https://github.com/user-attachments/assets/471b454b-4013-4218-8bd2-be03c11c2d79" />
+**A guided post-install for Proxmox Backup Server: a stable datastore on a Synology iSCSI LUN, a self-healing connection, and a login screen that shows you the state of everything.**
 
-<img width="589" height="167" alt="Connection" src="https://github.com/user-attachments/assets/ee873bf1-8ae9-4248-a6d0-538bdcdd1d21" />
+*Plain shell menus · CHAP · ext4 or XFS · keeps your data · repairs itself · live login dashboard*
 
-<img width="559" height="302" alt="ISCSI2" src="https://github.com/user-attachments/assets/bad544d3-cb31-485b-b6f4-5c58c8d03a56" />
+![version](https://img.shields.io/badge/version-1.7.4-2f81f7?style=for-the-badge)
+![debian](https://img.shields.io/badge/Debian-13%20trixie-d70a53?style=for-the-badge&logo=debian&logoColor=white)
+![pbs](https://img.shields.io/badge/Proxmox%20Backup%20Server-4.x-e57000?style=for-the-badge)
+![bash](https://img.shields.io/badge/Bash-5.x-4eaa25?style=for-the-badge&logo=gnubash&logoColor=white)
+![synology](https://img.shields.io/badge/Synology-iSCSI%20%2B%20CHAP-b5b5b5?style=for-the-badge)
+![license](https://img.shields.io/badge/license-MIT-yellow?style=for-the-badge)
 
-<img width="556" height="651" alt="Lun setup" src="https://github.com/user-attachments/assets/2cf7a386-b14c-4bb1-bba8-aaff1c438e28" />
+[Why](#why-this-exists) · [Features](#features) · [Quick start](#quick-start) · [Synology guide](#step-1--prepare-the-synology) · [The installer](#what-the-installer-does) · [Login screen](#the-login-screen) · [Commands](#command-reference) · [Troubleshooting](#troubleshooting) · [FAQ](#faq)
 
-<img width="965" height="650" alt="setup done" src="https://github.com/user-attachments/assets/4c170b02-d217-4d62-ae63-958b12b3f903" />
-
-<img width="1613" height="608" alt="ProxmoxPBS" src="https://github.com/user-attachments/assets/617ba011-9193-439c-b47d-7b02470aca24" />
-
+</div>
 
 ---
 
-## 🔄 Updating an Existing Installation
+## Why this exists
 
-Already running an older version? Just run the Quick Start command again — your LUN and backups are not touched.
+Putting a Proxmox Backup Server datastore on a Synology over iSCSI works well, until it doesn't. The usual ways it goes wrong:
 
-1. In **Options**, select only **Connect a Synology iSCSI LUN** and **Create a PBS datastore** (untick the rest if you don't need them).
-2. Pick your target. The script detects that the LUN is **already mounted** and keeps it exactly as it is.
-3. At the datastore question, choose **Keep the existing datastore - skip this step**.
+- the iSCSI session drops when the Synology updates or restarts, and the filesystem turns **read-only**;
+- the disk is not mounted yet when PBS starts, so PBS writes backups to the **system disk** by mistake;
+- a wrong or missing CHAP login retries **every minute** and floods the Synology log;
+- an existing disk with backups on it gets **formatted by accident**;
+- nobody notices a broken connection until the next backup fails.
 
-The installer then brings the `/etc/fstab` entry and the iSCSI monitor up to the current version (a backup of `/etc/fstab` is saved first).
+This script walks you through the whole setup with questions first and changes second, and then keeps watching the connection afterwards.
 
-Check the result:
+> **Nothing is changed until you confirm the plan.** All questions come first. A final review screen lists everything the installer is about to do. Disks are only erased if you explicitly choose it and type a confirmation.
+
+---
+
+## Features
+
+### Setup you can follow
+
+- **Plain shell menus**: arrow keys, Enter, number keys. No whiptail or dialog boxes. Black background, colored text, progress bar, live step checklist.
+- **Synology guide** before anything is touched: how to create the LUN and target, **thin vs thick**, CHAP, initiator access, MTU.
+- **Pick from a list**: the target IQN is discovered from the Synology. You do not copy and paste IQNs.
+- **LUN picker** when a target has several LUNs, and the chosen LUN is re-matched by WWN during the install.
+- **ext4 or XFS**, with a recommendation based on the LUN size (XFS from 4 TiB).
+
+### Protects your data
+
+- **Detects what is already on the LUN**: empty, an existing filesystem, or an existing **PBS datastore**. You choose to keep it or format it.
+- An existing datastore is **re-attached** (PBS 3.3+), so all backups stay.
+- Erasing needs an explicit choice **and** a typed confirmation.
+- A **write-protected empty mount directory** (`chattr +i`) so nothing can land on the system disk when the LUN is not mounted.
+- `/etc/fstab` is **backed up** before every change.
+
+### Stays up
+
+- **Survives a Synology restart or DSM update**: the iSCSI replacement timeout is raised from 2 to **10 minutes**.
+- **PBS starts after the mount** (systemd drop-in, `Wants=` and `After=`, so a dead NAS never blocks the web UI).
+- **Health monitor every minute**: session, mount, read-only detection, and a real **write test**. It **repairs by itself** (unmount, logout, login, mount, restart PBS) with a cooldown.
+- **CHAP-aware**: a rejected login is logged **once** and retried every 15 minutes, not every minute.
+- **Alerts** (optional): push message (ntfy or any webhook) or email, only when the state **changes**.
+- **Weekly TRIM** when the LUN supports it, so pruned backups give space back to the Synology.
+- Log rotation for the monitor log.
+
+### Knows what is going on
+
+- **Live login dashboard** (MOTD) with the same look as the installer.
+- **Interactive menu** (`pbs-menu`): live view, LUN details, storage, health check, check and repair now, logs, services, help.
+- **`--status`** health check you can also run from cron (exit codes 0 / 1 / 2).
+- **`--fix-login`** to type the CHAP login again for an installed target.
+
+### The rest of a post-install
+
+- Switches from the enterprise repository (needs a subscription) to the free **no-subscription** repository, and runs the upgrade.
+- Creates the **PBS datastore** (or re-attaches an existing one).
+- Removes the **"No valid subscription"** popup, using the "NO NAG" method of the community-scripts post-pbs-install script.
+
+---
+
+## What you see at login
+
+```
+   ██████╗ ██████╗ ███████╗
+   ██╔══██╗██╔══██╗██╔════╝   pbs  192.168.0.73
+   ██████╔╝██████╔╝███████╗   Proxmox Backup Server  4.2.8
+   ██╔═══╝ ██╔══██╗╚════██║   iSCSI storage on Synology
+   ██║     ██████╔╝███████║   ● ALL SYSTEMS HEALTHY
+   ╚═╝     ╚═════╝ ╚══════╝   pbs-motd v1.7.4 · by MorphyDK
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ╭─ Server
+  │ System         Debian GNU/Linux 13 (trixie) · kernel 7.0.14-25-pve
+  │ Uptime         2d 4h 12m   load 0.15 0.10 0.03  (4 cores)
+  │ Memory         ██░░░░░░░░░░░░░░░░░░░░░░  10%  404MB of 3.9GB
+  │ System disk    ████░░░░░░░░░░░░░░░░░░░░  17%  4.8GB of 28GB
+  │ Updates        ✔ up to date (checked 5h ago)
+  ╰─
+
+  ╭─ iSCSI storage · /mnt/synology
+  │ Synology       192.168.0.8   DS1821-1.default-target.961c91d51d1
+  │ Connection     ✔ connected · waits 10 min for the NAS
+  │ Mount          ✔ /dev/sdb1 · 50GB · ext4 · read-write
+  │ Space          ████████░░░░░░░░░░░░░░░░░░░░░░  27%
+  │                36GB free  · 13GB used of 49GB
+  │ TRIM           weekly - deleted backups give space back to the Synology
+  │ Monitor        ✔ checks every minute, repairs by itself · last check 12s ago
+  │ Last 24 hours  ✔ no problems logged
+  ╰─
+
+  ╭─ Backups
+  │ Datastore      synology-backup  /mnt/synology
+  │ PBS services   ✔ running · web UI https://192.168.0.73:8007
+  │ Last backup    OK · 6h ago
+  │ Last GC        OK · 25h ago
+  ╰─
+
+  Press m for the menu · h for help · or wait 5s
+```
+
+The dashboard is read when you log in, so the free space and connection state are always current. Right after a reboot it waits up to 25 seconds for the Synology instead of showing a false alarm.
+
+---
+
+## Quick start
+
+> Run it as **root**, in a terminal, on the Proxmox Backup Server. A window of 80×30 or larger looks best.
+
 ```bash
-grep /mnt/synology /etc/fstab                                  # should contain _netdev and end with 0 0
-grep -n timeout /usr/local/bin/check-iscsi-session-*.sh        # should show the login and mount timeouts
-tail -n 20 /var/log/iscsi-monitor.log                          # reconnect history
+# 1. get the script
+wget https://raw.githubusercontent.com/MorphyDK/pbs-synology-iscsi/main/pbs-post-install.sh
+
+# 2. read it first. You are about to run a root script, so that is only sensible.
+less pbs-post-install.sh
+
+# 3. run it
+chmod +x pbs-post-install.sh
+./pbs-post-install.sh
+```
+
+The questions take about two minutes. After the review screen the installer runs on its own.
+
+**Requirements**
+
+| | |
+|---|---|
+| Server | Proxmox Backup Server **4.x on Debian 13 "trixie"** (developed and tested on PBS 4.2). Older versions are untested, and re-attaching an existing datastore needs PBS 3.3 or newer |
+| NAS | Synology with DSM 7 and **SAN Manager** (iSCSI) |
+| Network | Wired, same LAN or VLAN as the Synology. A dedicated NIC or VLAN for iSCSI is best |
+| Packages | Installed for you: `open-iscsi`, `parted`, `xfsprogs` (and `curl` if you pick push alerts) |
+
+---
+
+## Step 1 · Prepare the Synology
+
+The installer shows this guide on screen too, but doing it first saves time.
+
+**1. Create the LUN** (DSM › SAN Manager › LUN › Create)
+
+| Setting | Recommendation |
+|---|---|
+| Name | e.g. `PBS-Backup` |
+| Location | The volume that should hold the backups |
+| Capacity | PBS deduplicates, but plan room for many versions |
+| Allocation | **Thin** or **Thick**, see below |
+
+| | Thin provisioning | Thick provisioning |
+|---|---|---|
+| Space on the NAS | Only what is actually written | Full size reserved immediately |
+| Performance | A little slower | Best and most consistent |
+| Space reclamation | **Yes**, pruned backups free space on the NAS (the installer enables weekly TRIM) | No |
+| Risk | The NAS volume can fill up if over-committed | Backups can never fail because the NAS is full |
+| Choose it when | The volume is shared with other data | The volume is dedicated to backups |
+
+**2. Create the iSCSI target** and map the LUN to it. Turn on **CHAP** and set a username and password (Synology wants 12–16 characters).
+
+**3. Allow only this PBS server.** Give this server's initiator IQN access to the target (the installer shows the IQN after it installs the iSCSI tools). Keep **Allow multiple sessions** disabled.
+
+> ⚠️ **Never connect the same LUN to two servers at the same time.** ext4 and XFS are not cluster filesystems. The data **will** be corrupted.
+
+**Network tips:** use a wired link, and the same MTU on both sides (jumbo frames on both, or on neither).
+
+---
+
+## What the installer does
+
+### Setup (questions only)
+
+| # | Step | What happens |
+|---|---|---|
+| 1 | Welcome | Shows the server, PBS version and OS |
+| 2 | Options | Tick what you want: repository, upgrade, iSCSI, datastore, popup removal, login screen |
+| 3 | iSCSI tools | Installs `open-iscsi`, `parted`, `xfsprogs`. Touches no disk |
+| 4 | Synology guide | Thin vs thick, target, CHAP, access |
+| 5 | Connection | Enter the Synology address, pick the target from a list, enter the CHAP login (tested immediately) |
+| 6 | LUN & filesystem | The LUN is inspected read-only. **Keep** the existing data or **format**. Choose ext4 or XFS |
+| 7 | Mount, datastore, extras | Mount path, datastore name and path, alerts, login screen style |
+| 8 | Review | The complete plan. Start, go back and change something, or quit |
+
+### Installation (runs on its own)
+
+| # | Step | What happens |
+|---|---|---|
+| 1 | APT repositories | Disables the enterprise repo, adds `pbs-no-subscription` |
+| 2 | System upgrade | `apt full-upgrade` |
+| 3 | Connect to iSCSI target | Saves the node record with CHAP, boot login and the 10-minute timeout |
+| 4 | Prepare disk | New GPT + filesystem, or keep what is there |
+| 5 | Mount via `/etc/fstab` | UUID-based line with `_netdev,nofail,x-systemd.device-timeout=30` |
+| 6 | Monitoring & boot order | Monitor script + cron, logrotate, systemd drop-ins for PBS, TRIM, alerts |
+| 7 | PBS datastore | Creates the datastore, or re-attaches the existing one |
+| 8 | Subscription popup | Applies the "NO NAG" patch |
+| 9 | Login screen | Dashboard, menu and help |
+| 10 | Finish | Summary, next steps, optional reboot |
+
+### Existing data on the LUN
+
+The installer opens the LUN **read-only** and tells you what it found:
+
+| Found | What you are offered |
+|---|---|
+| Empty LUN | Create a GPT partition and a filesystem |
+| A filesystem with files | **Keep it** (nothing is touched) or format |
+| A filesystem with a **PBS datastore** | Keep it and **re-attach** the datastore: all backups stay |
+| Already mounted on this server | Left mounted, only the monitoring and boot order are added |
+
+If you format, the installer shows what would be lost and asks you to type a confirmation.
+
+### ext4 or XFS?
+
+Both are fully supported for PBS datastores. PBS stores backups as many small chunk files.
+
+| | ext4 | XFS |
+|---|---|---|
+| Good for | The proven Linux default, easy to repair | Big volumes and millions of files |
+| Grow later | Yes | Yes (never shrink) |
+| Created with | 0 % reserved blocks (`-m 0`), so the whole LUN is usable | defaults |
+| Recommended | Under 4 TiB | **4 TiB and larger** |
+
+---
+
+## How it keeps the datastore stable
+
+| Problem | What the script does |
+|---|---|
+| The Synology restarts or updates | The iSCSI replacement timeout is **600 s** (default 120 s). The filesystem waits instead of seeing I/O errors |
+| The session drops | The monitor logs in again, mounts, and restarts PBS |
+| The filesystem goes read-only | Detected (`ro` mount option and a failed write). Repaired: unmount, logout, login, mount |
+| Dead storage that hangs | Every step has a timeout. A stuck write test keeps the lock, so runs never pile up |
+| PBS starts before the mount | systemd drop-in: PBS `Wants=` and `After=` the mount unit. A dead NAS still lets the web UI start |
+| Backups landing on the system disk | The empty mount directory is immutable (`chattr +i`) |
+| Wrong CHAP login | Logged once. Retried only every 15 minutes. Alert sent. Fix with `--fix-login` |
+| The installer overwrites a stored login | Stored logins are detected and reused. Saving an empty login is blocked |
+| Old leftover iSCSI records | Listed by the installer and `--status`, and can be removed |
+| Repair loops | Cooldown of 5 minutes between automatic repairs |
+| Alert spam | Alerts only when the state changes (ok → problem, problem → ok) |
+| Space not given back | Weekly `fstrim` when the LUN reports discard support |
+
+---
+
+## The login screen
+
+Enabled by default. Choose **dashboard + menu prompt** or **dashboard only** during setup.
+
+| Command | What it does |
+|---|---|
+| `pbs-motd` | Shows the dashboard |
+| `pbs-motd --watch` | Live view, refreshes every 3 seconds (`q` quits) |
+| `pbs-menu` | Interactive menu (or press `m` at login) |
+| `pbs-help` | The key commands for iSCSI, storage and PBS (or press `h` at login) |
+
+**The menu**
+
+1. Live view
+2. LUN & connection (target, login, session details, disks, and re-enter the CHAP login)
+3. Storage & datastore
+4. Health check (the full `--status`)
+5. Check & repair now
+6. Monitor log
+7. Services (status, restart PBS)
+8. Help · key commands
+9. Settings (what happens at login)
+
+It only runs for **root** in an interactive terminal. `scp`, `rsync` and scripts are never affected. The original `/etc/motd` is saved as `/etc/motd.pbs-orig`. Turn the screen off with `MODE=off` in `/etc/pbs-motd.conf`, or remove it with `--motd-remove`.
+
+---
+
+## Command reference
+
+```text
+./pbs-post-install.sh                 interactive installer
+./pbs-post-install.sh --status        health dashboard, changes nothing
+./pbs-post-install.sh --fix-login     type the CHAP username/password again
+./pbs-post-install.sh --motd          install or update only the login screen
+./pbs-post-install.sh --motd-remove   remove the login screen
+./pbs-post-install.sh --version
+./pbs-post-install.sh --help
+```
+
+After the first install a copy lives at `/usr/local/sbin/pbs-post-install.sh`, so `pbs-post-install.sh --status` works from anywhere. **That copy is replaced each time you run a newer file**, so check the version with `--version`.
+
+### `--status`
+
+Checks, per installation: session, stored CHAP login, reconnect wait, mount (read-write?), free space, a **write test**, TRIM, datastore, boot order, the monitor job, the last 24 hours of the monitor log, alerts, and leftover iSCSI records.
+
+| Exit code | Meaning |
+|---|---|
+| `0` | Healthy (warnings possible) |
+| `1` | A problem was found |
+| `2` | Not installed / not root |
+
+It prints plain text when piped, so it works in cron:
+
+```bash
+0 7 * * * root /usr/local/sbin/pbs-post-install.sh --status >/dev/null || echo "PBS storage problem" | mail -s "PBS" you@example.com
 ```
 
 ---
 
-## 📸 How It Works (Stepper Architecture)
+## What it changes on your system
 
-The installer splits execution into an interactive **Setup** menu and an unattended **Installation** pipeline:
-
-**Setup (interactive — nothing on any disk is changed)**
-Welcome › Options › iSCSI tools › Synology guide › Connection test › LUN & filesystem inspection › Mount & datastore › Review of the full plan
-
-**Installation (unattended, with progress bar)**
-APT repositories › System upgrade › Connect to iSCSI target › Prepare disk › Mount via `/etc/fstab` › Monitoring & TRIM › PBS datastore › Subscription popup › Finish
-
-Everything is logged to `/var/log/pbs-post-install.log` (CHAP secrets are never written to the log).
+| Path | Purpose |
+|---|---|
+| `/etc/apt/sources.list.d/` | Enterprise repo disabled (`Enabled: false`), `pbs-no-subscription.sources` added |
+| `/etc/iscsi/nodes/…` | iSCSI node record: CHAP login, `node.startup=automatic`, `replacement_timeout=600` (root-only) |
+| `/etc/fstab` | One UUID line with `_netdev,nofail,x-systemd.device-timeout=30`. Backup: `/etc/fstab.backup.<date>` |
+| `/usr/local/bin/check-iscsi-session-<name>.sh` | The monitor |
+| root crontab | `*/1 * * * *` the monitor |
+| `/etc/pbs-iscsi-monitor-<name>.conf` | Alert settings, mode 600 |
+| `/var/log/iscsi-monitor.log` | Monitor log. Rotated weekly, 8 weeks (`/etc/logrotate.d/pbs-iscsi-monitor`) |
+| `/etc/systemd/system/proxmox-backup{,-proxy}.service.d/10-iscsi-<name>.conf` | PBS starts after the mount |
+| `/etc/apt/apt.conf.d/no-nag-script` | Subscription popup patch, re-applied after every update |
+| `/usr/local/sbin/pbs-motd` + `/usr/local/bin/pbs-{motd,menu,help}` | Login screen |
+| `/etc/profile.d/pbs-motd.sh`, `/etc/pbs-motd.conf`, `/etc/cron.d/pbs-motd` | Login hook, its setting, daily update count |
+| `/usr/local/sbin/pbs-post-install.sh` | Copy of this script |
+| `/var/log/pbs-post-install.log` | Installer log (mode 600) |
 
 ---
 
-## 📝 Changelog
+## Security notes
 
-### v1.5 — 18/10-2026
-*   Re-running on an already mounted LUN now corrects an outdated `/etc/fstab` entry from older versions (adds `_netdev`, disables boot-time fsck).
-*   iSCSI monitor: 30 s timeout on login and 60 s timeout on mount, so a hanging attempt against an unreachable NAS can no longer block the reconnects that follow.
+- The **CHAP password** is stored in the iSCSI node record under `/etc/iscsi/nodes`, readable by root only. open-iscsi needs it to reconnect on its own. It is never written to the logs, and `iscsiadm` masks it when shown.
+- The **alert URL** (an ntfy topic name is effectively a password) is stored in a root-only file (mode 600).
+- Use a **dedicated CHAP login** for this target, not one you use anywhere else.
+- Allow only this server's initiator IQN on the Synology.
+- Read the script before running it. It is plain bash, and it runs as root.
 
-### v1.4 — 10/3-2026
-*   Previous release.
+---
+
+## Troubleshooting
+
+<details>
+<summary><b><code>apt update</code> fails with <code>401 Unauthorized</code> from <code>enterprise.proxmox.com</code></b></summary>
+
+The enterprise repository needs a paid subscription. The installer switches it off before its first `apt update`. To do it by hand:
+
+```bash
+for f in $(grep -rl enterprise.proxmox.com /etc/apt/sources.list.d/); do mv "$f" "$f.disabled"; done
+cat > /etc/apt/sources.list.d/pbs-no-subscription.sources <<'EOF'
+Types: deb
+URIs: http://download.proxmox.com/debian/pbs
+Suites: trixie
+Components: pbs-no-subscription
+Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg
+EOF
+apt update
+```
+</details>
+
+<details>
+<summary><b>Synology log: <code>failed to login … due to CHAP required but absent</code>, once a minute</b></summary>
+
+The stored CHAP login is missing or empty. Run `pbs-post-install.sh --fix-login`, then `--status`. The monitor now waits 15 minutes between attempts after a rejected login, so a wrong password cannot flood the log.
+</details>
+
+<details>
+<summary><b>The login screen shows red "not connected" lines</b></summary>
+
+If the server just booted, wait a minute. The dashboard waits up to 25 seconds and shows only a yellow note in the first minutes. If it stays red: `pbs-menu` › **Check & repair now**, then look at `journalctl -b -u iscsid -u open-iscsi`.
+</details>
+
+<details>
+<summary><b>The mount is read-only</b></summary>
+
+The filesystem hit an I/O error, usually after a long NAS outage. The monitor repairs it automatically within a minute or two. By hand: `pbs-menu` › **Check & repair now**.
+</details>
+
+<details>
+<summary><b>The installer seems stuck on "Upgrading packages"</b></summary>
+
+The spinner shows minutes:seconds and the last line of output. After 5 minutes of silence it turns yellow. Check `ps aux | grep -E 'apt|dpkg'` and `tail -30 /var/log/pbs-post-install.log`.
+</details>
+
+<details>
+<summary><b>The status check shows a yellow warning</b></summary>
+
+Read the line with `⚠`. Common ones: free space over 85 %, `fstrim.timer` not running, or a leftover iSCSI record. A normal reconnect after a reboot is **not** counted as a problem.
+</details>
+
+<details>
+<summary><b>The subscription popup came back after an update</b></summary>
+
+The apt hook re-applies the patch after every package change. If a PBS update changes the web UI code, the pattern may stop matching. Re-run the installer, or: `apt --reinstall install proxmox-widget-toolkit`, then reload the browser with Ctrl+Shift+R.
+</details>
+
+<details>
+<summary><b>Where are the logs?</b></summary>
+
+| | |
+|---|---|
+| Installer | `/var/log/pbs-post-install.log` |
+| Monitor | `/var/log/iscsi-monitor.log` |
+| iSCSI | `journalctl -u iscsid` |
+| PBS | `journalctl -u proxmox-backup-proxy` |
+</details>
+
+---
+
+## FAQ
+
+**Does it erase my disk?**
+Only if you choose *format* and type the confirmation. *Keep* touches nothing.
+
+**Can I re-run it?**
+Yes. It detects a mounted LUN, keeps a stored CHAP login, corrects an outdated `/etc/fstab` line, and re-attaches an existing datastore. To only update the login screen, use `--motd`.
+
+**Does it work with more than one LUN or target?**
+Yes. `--status`, the menu and the dashboard handle several installations. A target with several LUNs shows a picker.
+
+**Can I skip parts?**
+Yes. Step 2 of the setup lets you untick the repository switch, the upgrade, iSCSI, the datastore, the popup removal and the login screen.
+
+**Why not whiptail?**
+Plain shell menus are lighter, work over any SSH session, and look the same everywhere.
+
+**Is the popup removal OK?**
+It is the community-maintained approach, and it keeps the software working. If PBS is useful to you, please consider a subscription to support its developers.
+
+**Other NAS brands?**
+It is written for Synology (the guide, the CHAP limits, the IQN style). Any iSCSI target should work with the same commands, but only Synology is tested.
+
+---
+
+## Undo
+
+```bash
+./pbs-post-install.sh --motd-remove                   # login screen
+
+# monitor + boot order (replace <name> with your mount directory name, e.g. synology)
+crontab -l | grep -v "iSCSI monitor for <name>" | crontab -
+rm /usr/local/bin/check-iscsi-session-<name>.sh /etc/pbs-iscsi-monitor-<name>.conf
+rm /etc/systemd/system/proxmox-backup{,-proxy}.service.d/10-iscsi-<name>.conf && systemctl daemon-reload
+
+# popup patch
+rm /etc/apt/apt.conf.d/no-nag-script && apt --reinstall install proxmox-widget-toolkit
+
+# disk and connection: unmount, remove the fstab line, then
+chattr -i /mnt/<name>
+iscsiadm -m node -T <target-iqn> -p <portal> --logout
+iscsiadm -m node -T <target-iqn> -p <portal> -o delete
+```
+
+The datastore itself is removed in the PBS web UI (Datastore › Remove). That does not delete the backups on the LUN.
+
+---
+
+## Tested, and not yet tested
+
+**Developed and run against:** Proxmox Backup Server 4.2.x on Debian 13 (trixie), a Synology NAS over iSCSI with CHAP, a fresh LUN formatted as ext4, a thin-provisioned LUN with TRIM.
+
+**Not yet verified on real hardware:** what happens through a full DSM update/reboot with a backup running, the automatic repair after a long outage, XFS on very large LUNs, and the PBS task parsing on the login screen (last backup, GC, verify). **Please test restores before you rely on any backup setup**, and open an issue if something behaves differently on your system.
+
+The script has not been linted with `shellcheck` yet.
+
+---
+
+## Roadmap
+
+- Backblaze B2 as a remote datastore (PBS S3 datastores, tech preview)
+- Datastore prune and garbage-collection presets
+- `--uninstall` and `--dry-run`
+
+---
+
+## Credits & license
+
+- Inspired by **Derek Seaman's** guide to PBS on Synology iSCSI.
+- The "NO NAG" popup method comes from the **community-scripts** post-pbs-install script (MIT).
+- Written by **MorphyDK**, with the help of Claude.
+
+Released under the **MIT License**. Use it at your own risk. Always keep a second copy of data that matters.
+
+<div align="center">
+
+**If this saved you a weekend of debugging, a ⭐ on the repo is very welcome.**
+
+</div>
