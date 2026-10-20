@@ -17,6 +17,12 @@
 #         ./pbs-post-install.sh --motd-remove  remove the login screen again
 #         ./pbs-post-install.sh --help
 #
+# Changes in 1.7.6:
+#  - Formatting is much faster on big LUNs: no block-by-block discard while creating the
+#    filesystem (ext4 -E nodiscard, XFS -K). Space is given back to the Synology afterwards
+#    by a TRIM that runs in the background, and weekly
+#  - The spinner shows the real progress of mkfs ("progress 524288/13106688 (4%)")
+#
 # Changes in 1.7.5:
 #  - Timers (the "Elapsed" line, the spinner, the final "completed in") use a monotonic clock.
 #    Before, a clock correction by time sync in the middle of the install (common in VMs)
@@ -81,7 +87,7 @@
 set -eE
 export LC_ALL=C.UTF-8
 
-VERSION="1.7.5"
+VERSION="1.7.6"
 LOG_FILE="/var/log/pbs-post-install.log"
 FS_LABEL="pbs-data"
 FOUR_TIB=4398046511104
@@ -669,7 +675,12 @@ _run_with_spinner() {
             if [[ "$sz" != "$last_sz" ]]; then
                 last_sz=$sz
                 last_change=$MONO
-                last_line=$(tail -n 1 "$LOG_FILE" 2>/dev/null | tr -cd '[:print:]' | sed 's/^[[:space:]]*//')
+                # Progress meters (mkfs) redraw one line with \r and backspaces: show the newest value
+                last_line=$(tail -c 400 "$LOG_FILE" 2>/dev/null | tr '\b\r' '\n\n' | tr -cd '[:print:]\n' \
+                    | grep -v '^[[:space:]]*$' | tail -n 1 | sed 's/^[[:space:]]*//')
+                if [[ "$last_line" =~ ^([0-9]+)/([0-9]+)$ && ${BASH_REMATCH[2]} -gt 0 ]]; then
+                    last_line="progress ${last_line} ($(( BASH_REMATCH[1] * 100 / BASH_REMATCH[2] ))%)"
+                fi
             fi
         fi
         mono
@@ -2275,10 +2286,10 @@ step_disk() {
     fi
 
     if [[ "$FS_TYPE" == "xfs" ]]; then
-        run_quiet "Formatting ${PARTITION} as XFS" mkfs.xfs -f -L "$FS_LABEL" "$PARTITION"
+        run_quiet "Formatting ${PARTITION} as XFS" mkfs.xfs -f -K -L "$FS_LABEL" "$PARTITION"
     else
-        run_quiet "Formatting ${PARTITION} as ext4 (large LUNs take a while)" \
-            mkfs.ext4 -F -m 0 -L "$FS_LABEL" "$PARTITION"
+        run_quiet "Formatting ${PARTITION} as ext4" \
+            mkfs.ext4 -F -m 0 -E nodiscard -L "$FS_LABEL" "$PARTITION"
     fi
     udevadm settle >/dev/null 2>&1 || true
 
@@ -2700,7 +2711,7 @@ EOF
         if [[ $RUN_RC -eq 0 ]]; then
             detail+=" · weekly TRIM"
         fi
-        if [[ "$DISK_ACTION" == "keep" ]]; then
+        if [[ "$DISK_ACTION" == "keep" || "$DISK_ACTION" == "format" ]]; then
             # The first TRIM of an existing filesystem can take a long time over iSCSI,
             # so it runs in the background instead of holding up the installer
             if systemctl start --no-block fstrim.service >/dev/null 2>&1; then
