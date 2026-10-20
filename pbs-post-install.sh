@@ -7,8 +7,67 @@
 # 
 # Thanks to Derek Seaman's Tech Blog who inspired me to make this.
 #
-# Version 1.5  18/10-2026
+# Version 1.7.4  20/10-2026
 # Author MorphyDK
+#
+# Usage:  ./pbs-post-install.sh              interactive installer
+#         ./pbs-post-install.sh --status     health dashboard (no changes)
+#         ./pbs-post-install.sh --fix-login  re-enter the CHAP login of an installed target
+#         ./pbs-post-install.sh --motd       install / update only the login screen
+#         ./pbs-post-install.sh --motd-remove  remove the login screen again
+#         ./pbs-post-install.sh --help
+#
+# Changes in 1.7.4:
+#  - --status: a normal reconnect after a reboot no longer counts as a "problem event"
+#
+# Changes in 1.7.3:
+#  - The progress spinner shows minutes:seconds, the last line the running command printed,
+#    and a warning when it has been silent for 5 minutes (a stuck apt/dpkg is easy to spot)
+#
+# Changes in 1.7.2:
+#  - Subscription popup: now uses the "NO NAG" method of the community-scripts
+#    post-pbs-install script (apt hook /etc/apt/apt.conf.d/no-nag-script). The older patch
+#    of this installer is removed automatically
+#
+# Changes in 1.7.1:
+#  - Login screen right after a boot: it waits (max 25 s) for the Synology connection instead
+#    of showing red "not connected" lines, starts the monitor once if needed, and shows only a
+#    yellow note during the first minutes after boot
+#  - A normal reconnect after a reboot no longer counts as a "problem event"
+
+# Changes in 1.7:
+#  - NEW login screen (MOTD): when you log in to the server you get a live dashboard with the
+#    same look as the installer - server health, the Synology connection, mount, free space
+#    (read live at every login), the monitor, services, running and last finished backup tasks
+#  - NEW interactive menu (pbs-menu, or press m at login): live view, LUN details, storage,
+#    full health check, "check & repair now", monitor log, services, help, settings
+#  - NEW pbs-help: the key commands for iSCSI, storage and PBS on one page
+#  - Enterprise repository is switched off before the first apt update (fixes the 401 error)
+#
+# Changes in 1.6.1 (fixes a bug found on a real system - Synology log:
+#   "failed to login ... due to CHAP required but absent", once a minute):
+#  - Re-running the installer while the LUN was still connected could overwrite the
+#    stored CHAP username/password with EMPTY values. Stored logins are now detected and
+#    kept (or re-asked); writing an empty login is blocked with a safety stop
+#  - The monitor no longer retries a rejected login every minute: it logs the cause once,
+#    waits 15 minutes between attempts (a wrong password every minute can lock the account)
+#    and sends an alert
+#  - Leftover iSCSI records (old tests, other portals) are listed by the installer and by
+#    --status; ones that log in at boot without a valid CHAP login can be removed
+#  - New --fix-login: type the CHAP login again for an installed target, test it, remount
+#  - An existing record keeps its boot setting while the installer tests a login
+#
+# Changes in 1.6:
+#  - Survives a Synology reboot/update: the iSCSI "replacement timeout" is raised
+#    from 2 to 10 minutes, so the filesystem does not see I/O errors meanwhile
+#  - Smarter monitor: write test, read-only / hung-storage detection and an
+#    automatic repair (unmount > logout > login > mount) with a cooldown,
+#    optional alerts (ntfy / webhook / email) and log rotation
+#  - PBS now starts after the iSCSI mount (systemd drop-in; never blocks the web UI)
+#  - LUN picker: a target with several LUNs shows a list instead of silently
+#    using the first one; the chosen LUN is re-matched by WWN during the install
+#  - New --status dashboard: session, mount, space, write test, TRIM, datastore,
+#    monitor log. Exit code 1 if something is wrong (usable from cron / scripts)
 #
 # Changes in 1.5:
 #  - Re-running on an already mounted LUN now corrects an outdated /etc/fstab line
@@ -17,10 +76,14 @@
 set -eE
 export LC_ALL=C.UTF-8
 
-VERSION="1.5"
+VERSION="1.7.4"
 LOG_FILE="/var/log/pbs-post-install.log"
 FS_LABEL="pbs-data"
 FOUR_TIB=4398046511104
+# How long the kernel waits for a lost iSCSI connection before it reports I/O
+# errors (open-iscsi default: 120). 600 = 10 minutes, enough for a DSM update.
+REPLACEMENT_TIMEOUT=600
+DS_CFG="${DS_CFG:-/etc/proxmox-backup/datastore.cfg}"
 
 # ---------------------------------------------------------------------------
 # Colours
@@ -64,6 +127,8 @@ DO_UPGRADE=1
 DO_ISCSI=1
 DO_DS=1
 DO_NAG=1
+DO_MOTD=1
+MOTD_MODE="prompt"   # prompt | dashboard
 GUIDE_DONE=0
 declare -a NOTES=()
 OS_CODENAME=""
@@ -85,10 +150,21 @@ PROBE_SESSION=0
 PROBE_TMP=""
 LOGIN_RC=0
 
+CHAP_KEEP=0          # 1 = keep the CHAP login already stored in the node record
+NODE_PREEXISTED=0
+declare -a KNOWN_NODES=()
+NOTIFY_MODE="none"   # none | url | mail
+NOTIFY_URL=""
+NOTIFY_MAIL=""
+SELF_CMD=""
+
 DEVICE_PATH=""
+declare -a LUN_DEVS=()
 LUN_SIZE=""
 LUN_SIZE_H=""
 LUN_WWN=""
+LUN_SERIAL=""
+LUN_NUM=""
 LUN_MODEL=""
 LUN_DISCARD=0
 LUN_EMPTY=0
@@ -132,7 +208,7 @@ APT_OPTS=(-y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-co
 # ---------------------------------------------------------------------------
 # Setup stepper + install checklist
 # ---------------------------------------------------------------------------
-SETUP_NAMES=("Welcome" "Options" "iSCSI tools" "Synology guide" "Connection" "LUN & filesystem" "Mount & datastore" "Review")
+SETUP_NAMES=("Welcome" "Options" "iSCSI tools" "Synology guide" "Connection" "LUN & filesystem" "Mount, datastore, extras" "Review")
 
 STEP_NAMES=(
     "APT repositories"
@@ -140,12 +216,13 @@ STEP_NAMES=(
     "Connect to iSCSI target"
     "Prepare disk"
     "Mount via /etc/fstab"
-    "Monitoring & TRIM"
+    "Monitoring & boot order"
     "PBS datastore"
     "Subscription popup"
+    "Login screen (MOTD)"
     "Finish"
 )
-S_REPO=0; S_UPG=1; S_CONN=2; S_DISK=3; S_MOUNT=4; S_MON=5; S_DS=6; S_NAG=7; S_FIN=8
+S_REPO=0; S_UPG=1; S_CONN=2; S_DISK=3; S_MOUNT=4; S_MON=5; S_DS=6; S_NAG=7; S_MOTD=8; S_FIN=9
 TOTAL_STEPS=${#STEP_NAMES[@]}
 BAR_WIDTH=36
 declare -a STEP_STATUS STEP_DETAIL
@@ -157,8 +234,8 @@ done
 # ---------------------------------------------------------------------------
 # Terminal helpers
 # ---------------------------------------------------------------------------
-hide_cursor() { printf '\e[?25l'; }
-show_cursor() { printf '\e[?25h'; }
+hide_cursor() { if [[ -t 1 ]]; then printf '\e[?25l'; fi; }
+show_cursor() { if [[ -t 1 ]]; then printf '\e[?25h'; fi; }
 
 term_cols() {
     local c
@@ -562,13 +639,41 @@ confirm_erase() {
 _run_with_spinner() {
     local desc="$1"
     shift
-    local frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏) i=0 start=$SECONDS
+    local frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏) i=0 start=$SECONDS el
+    local sz last_sz=-1 last_change=$SECONDS last_line="" stall cols room extra="" colour
     { echo; echo "=== $(date '+%F %T')  $desc"; } >> "$LOG_FILE"
     hide_cursor
     "$@" </dev/null >> "$LOG_FILE" 2>&1 &
     BG_PID=$!
+    cols=$(term_cols)
     while kill -0 "$BG_PID" 2>/dev/null; do
-        printf '\r  %s%s%s %s %s(%ds)%s\033[K' "$CYAN" "${frames[i % 10]}" "$NC" "$desc" "$DIM" $(( SECONDS - start )) "$NC"
+        # About once a second: has the command printed anything new?
+        if (( i % 8 == 0 )); then
+            sz=$(stat -c %s "$LOG_FILE" 2>/dev/null || echo 0)
+            if [[ "$sz" != "$last_sz" ]]; then
+                last_sz=$sz
+                last_change=$SECONDS
+                last_line=$(tail -n 1 "$LOG_FILE" 2>/dev/null | tr -cd '[:print:]' | sed 's/^[[:space:]]*//')
+            fi
+        fi
+        el=$(( SECONDS - start ))
+        stall=$(( SECONDS - last_change ))
+        room=$(( cols - ${#desc} - 18 ))
+        extra=""
+        colour="$DIM"
+        if (( stall >= 300 )); then
+            colour="$YELLOW"
+            extra=" ⚠ no output for $(( stall / 60 )) min - may be stuck (log: ${LOG_FILE})"
+        elif [[ -n "$last_line" ]]; then
+            extra=" · ${last_line}"
+        fi
+        if (( room > 8 )); then
+            extra=$(trunc "$extra" "$room")
+        else
+            extra=""
+        fi
+        printf '\r  %s%s%s %s %s(%02d:%02d)%s%s%s%s\033[K' "$CYAN" "${frames[i % 10]}" "$NC" "$desc" \
+            "$DIM" $(( el / 60 )) $(( el % 60 )) "$NC" "$colour" "$extra" "$NC"
         i=$(( i + 1 ))
         sleep 0.12
     done
@@ -579,7 +684,8 @@ _run_with_spinner() {
     printf '\r\033[K'
     show_cursor
     if [[ $RUN_RC -eq 0 ]]; then
-        printf '  %s✔%s %s %s(%ds)%s\n' "$GREEN" "$NC" "$desc" "$DIM" $(( SECONDS - start )) "$NC"
+        el=$(( SECONDS - start ))
+        printf '  %s✔%s %s %s(%02d:%02d)%s\n' "$GREEN" "$NC" "$desc" "$DIM" $(( el / 60 )) $(( el % 60 )) "$NC"
     fi
 }
 
@@ -599,11 +705,74 @@ run_quiet_soft() {
     _run_with_spinner "$@"
 }
 
+# Is any APT source still pointing at the (subscription-only) enterprise repo?
+enterprise_repo_active() {
+    local f
+    shopt -s nullglob
+    for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+        grep -qE '^[[:space:]]*deb .*enterprise\.proxmox\.com' "$f" 2>/dev/null && { shopt -u nullglob; return 0; }
+    done
+    for f in /etc/apt/sources.list.d/*.sources; do
+        if grep -qi 'enterprise\.proxmox\.com' "$f" 2>/dev/null \
+            && ! grep -qiE '^Enabled:[[:space:]]*(no|false)' "$f"; then
+            shopt -u nullglob; return 0
+        fi
+    done
+    shopt -u nullglob
+    return 1
+}
+
+# Switch the enterprise repo off (it answers 401 without a paid subscription).
+disable_enterprise_repos() {
+    local f changed=0
+    shopt -s nullglob
+    for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+        if grep -qE '^[[:space:]]*deb .*enterprise\.proxmox\.com' "$f" 2>/dev/null; then
+            sed -i '/enterprise\.proxmox\.com/s/^[[:space:]]*deb /# deb /' "$f"
+            ok "Disabled the enterprise repository in $(basename "$f")"; changed=1
+        fi
+    done
+    for f in /etc/apt/sources.list.d/*.sources; do
+        if grep -qi 'enterprise\.proxmox\.com' "$f" 2>/dev/null \
+            && ! grep -qiE '^Enabled:[[:space:]]*(no|false)' "$f"; then
+            if grep -qi '^Enabled:' "$f"; then
+                sed -i 's/^Enabled:.*/Enabled: false/I' "$f"
+            else
+                echo "Enabled: false" >> "$f"
+            fi
+            ok "Disabled the enterprise repository in $(basename "$f")"; changed=1
+        fi
+    done
+    shopt -u nullglob
+    # Last resort: still active? move the file out of the way.
+    if enterprise_repo_active; then
+        shopt -s nullglob
+        for f in /etc/apt/sources.list.d/*enterprise*; do
+            [[ "$f" == *.disabled ]] && continue
+            mv "$f" "$f.disabled" && ok "Moved $(basename "$f") out of the way" && changed=1
+        done
+        shopt -u nullglob
+    fi
+    [[ $changed -eq 1 ]]
+}
+
 apt_update() {
     run_quiet_soft "Updating package lists" apt-get -q update
     if [[ $RUN_RC -ne 0 ]]; then
-        APT_WARN="apt update had warnings"
-        warn "apt update reported warnings (see the log) - continuing"
+        if enterprise_repo_active; then
+            APT_WARN="enterprise repo needs a subscription"
+            warn "The Proxmox ENTERPRISE repository answers 401 without a paid subscription."
+            if [[ ${DO_REPO:-0} -eq 1 ]]; then
+                disable_enterprise_repos || true
+                run_quiet_soft "Updating package lists (enterprise repo off)" apt-get -q update
+                [[ $RUN_RC -eq 0 ]] && APT_WARN=""
+            else
+                warn "Re-run the installer and tick the no-subscription repository option."
+            fi
+        else
+            APT_WARN="apt update had warnings"
+            warn "apt update reported warnings (see $LOG_FILE) - continuing"
+        fi
     fi
     APT_UPDATED=1
 }
@@ -644,15 +813,141 @@ node_update() {
 
 # Creates a node record for ONLY the chosen target (discovery itself stores nothing)
 create_node_record() {
+    NODE_PREEXISTED=1
     if ! iscsiadm -m node -T "$TARGET_IQN" -p "$PORTAL_IP" >/dev/null 2>&1; then
         iscsiadm -m node -T "$TARGET_IQN" -p "$PORTAL_IP" -o new >/dev/null
         NODES_CREATED+=("${TARGET_IQN}|${PORTAL_IP}")
+        NODE_PREEXISTED=0
+    fi
+}
+
+# Value of one setting in a node record:  node_field PORTAL IQN node.startup
+node_field() {
+    iscsiadm -m node -T "$2" -p "$1" -o show 2>/dev/null \
+        | awk -F' = ' -v k="$3" '$1 == k { print $2; exit }' || true
+}
+
+# chap | none | incomplete | missing        node_auth_state PORTAL IQN
+# (iscsiadm masks the stored password, so "chap" means: method CHAP, and both the
+#  username and the password are set - an empty password shows up as <empty>)
+node_auth_state() {
+    local am user pw
+    if ! iscsiadm -m node -T "$2" -p "$1" >/dev/null 2>&1; then
+        echo missing
+        return 0
+    fi
+    am=$(node_field "$1" "$2" node.session.auth.authmethod)
+    user=$(node_field "$1" "$2" node.session.auth.username)
+    pw=$(node_field "$1" "$2" node.session.auth.password)
+    if [[ "$am" == "CHAP" ]]; then
+        if [[ -n "$user" && "$user" != "<empty>" && -n "$pw" && "$pw" != "<empty>" ]]; then
+            echo chap
+        else
+            echo incomplete
+        fi
+    else
+        echo none
+    fi
+}
+
+stored_chap_state() {
+    node_auth_state "$PORTAL_IP" "$TARGET_IQN"
+}
+
+# "address:port" without the ",tpgt" that iscsiadm appends
+norm_portal() {
+    local p="${1%%,*}"
+    if [[ ! "$p" =~ :[0-9]+$ ]]; then
+        p="${p}:3260"
+    fi
+    echo "$p"
+}
+
+# Prints "portal|iqn" for every node record stored on this server
+list_node_records() {
+    iscsiadm -m node 2>/dev/null | awk 'NF >= 2 { split($1, a, ","); print a[1] "|" $2 }' || true
+}
+
+# Records that no installation uses (not in KNOWN_NODES) and that have no running
+# session. Prints "portal|iqn|startup|auth-state".
+find_stale_records() {
+    local rec portal iqn k is_known
+    while IFS= read -r rec; do
+        if [[ -z "$rec" ]]; then continue; fi
+        portal="${rec%%|*}"
+        iqn="${rec#*|}"
+        is_known=0
+        for k in "${KNOWN_NODES[@]}"; do
+            if [[ "$k" == "${iqn}|$(norm_portal "$portal")" ]]; then
+                is_known=1
+            fi
+        done
+        if [[ $is_known -eq 1 ]]; then continue; fi
+        if iscsiadm -m session 2>/dev/null | awk -v t="$iqn" '$4 == t { f = 1 } END { exit !f }'; then
+            continue
+        fi
+        echo "${portal}|${iqn}|$(node_field "$portal" "$iqn" node.startup)|$(node_auth_state "$portal" "$iqn")"
+    done < <(list_node_records)
+}
+
+# During setup: shows leftover records (old tests, other portals, older script
+# versions) and offers to remove them. They log in at boot and fill the
+# Synology's log with failed logins when they have no valid CHAP login.
+offer_stale_cleanup() {
+    local -a stale=()
+    local rec portal iqn startup auth broken=0 choice def=1 line
+    KNOWN_NODES=("${TARGET_IQN}|$(norm_portal "$PORTAL_IP")")
+    mapfile -t stale < <(find_stale_records)
+    if [[ ${#stale[@]} -eq 0 ]]; then
+        return 0
+    fi
+    echo
+    panel_top "Other iSCSI records on this server" "$YELLOW"
+    panel_line "Not used by this installation, and no running session:"
+    panel_blank
+    for rec in "${stale[@]}"; do
+        IFS='|' read -r portal iqn startup auth <<< "$rec"
+        line="${iqn##*:}  ${portal}  ${DIM}boot login: ${startup:-?} · CHAP: ${auth}${NC}"
+        if [[ "$startup" == "automatic" && "$auth" != "chap" ]]; then
+            broken=$(( broken + 1 ))
+            panel_line "${RED}✘${NC} ${line}"
+        else
+            panel_line "• ${line}"
+        fi
+    done
+    if [[ $broken -gt 0 ]]; then
+        panel_blank
+        panel_line "${RED}✘ = tries to log in at boot without a valid CHAP login. The Synology${NC}"
+        panel_line "${RED}  logs every attempt as a failed login.${NC}"
+    fi
+    panel_bottom
+    if [[ $broken -eq ${#stale[@]} ]]; then
+        def=0
+    fi
+    menu_select choice "$def" \
+        "Remove these ${#stale[@]} record(s)|Deletes only the saved iSCSI settings on this server - nothing on the Synology" \
+        "Keep them|Leave everything as it is"
+    if [[ $choice -eq 0 ]]; then
+        for rec in "${stale[@]}"; do
+            IFS='|' read -r portal iqn startup auth <<< "$rec"
+            if iscsiadm -m node -T "$iqn" -p "$portal" -o delete >/dev/null 2>&1; then
+                ok "Removed ${iqn##*:} at ${portal}"
+            else
+                warn "Could not remove ${iqn##*:} at ${portal}"
+            fi
+        done
     fi
 }
 
 # Writes the authentication settings into the node record (never on screen or in the log)
 apply_auth() {
+    if [[ $CHAP_KEEP -eq 1 ]]; then
+        return 0    # keep the CHAP login that is already stored in the record
+    fi
     if [[ $CHAP_MODE -eq 1 ]]; then
+        if [[ -z "$CHAP_USER" || -z "$CHAP_PASS" ]]; then
+            fatal "Safety stop: no CHAP username/password is available - refusing to overwrite the stored login with empty values."
+        fi
         node_update node.session.auth.authmethod CHAP
         node_update node.session.auth.username "$CHAP_USER"
         node_update node.session.auth.password "$CHAP_PASS"
@@ -680,22 +975,35 @@ logout_probe() {
     fi
 }
 
-# Prints the /dev/sdX that is attached (and running) for $TARGET_IQN
-get_target_device() {
+# Prints every /dev/sdX that is attached (and running) for $TARGET_IQN, one per line
+get_target_devices() {
     iscsiadm -m session -P 3 2>/dev/null | awk -v t="$TARGET_IQN" '
         /^[[:space:]]*Target:/ { in_t = ($2 == t) }
-        in_t && /Attached scsi disk/ && /State: running/ { print "/dev/" $4; exit }
+        in_t && /Attached scsi disk/ && /State: running/ { print "/dev/" $4 }
     ' || true
 }
 
-# Waits (max ~20s, with one rescan) for the target's disk to show up
-wait_for_device() {
-    local dev attempt rescanned=0
+# Waits (max ~20s, with one rescan) for the target's disk(s) to show up.
+# Prints all of them, one per line (a target can hold several LUNs).
+wait_for_devices() {
+    local devs d attempt rescanned=0 all_ready
     for attempt in $(seq 1 20); do
-        dev=$(get_target_device)
-        if [[ -n "$dev" && -b "$dev" ]]; then
-            echo "$dev"
-            return 0
+        devs=$(get_target_devices)
+        if [[ -n "$devs" ]]; then
+            # give further LUNs of the same target a moment to appear
+            sleep 2
+            udevadm settle >/dev/null 2>&1 || true
+            devs=$(get_target_devices)
+            all_ready=1
+            while IFS= read -r d; do
+                if [[ -n "$d" && ! -b "$d" ]]; then
+                    all_ready=0
+                fi
+            done <<< "$devs"
+            if [[ $all_ready -eq 1 && -n "$devs" ]]; then
+                echo "$devs"
+                return 0
+            fi
         fi
         if [[ $attempt -eq 10 && $rescanned -eq 0 ]]; then
             iscsiadm -m session --rescan >/dev/null 2>&1 || true
@@ -703,6 +1011,98 @@ wait_for_device() {
         fi
         sleep 1
     done
+    return 1
+}
+
+# lun_attr /dev/sdX COLUMN  ->  one lsblk value (WWN, SERIAL, SIZE, HCTL ...), trimmed
+lun_attr() {
+    lsblk -dno "$2" "$1" 2>/dev/null | head -n 1 | xargs || true
+}
+
+# SCSI LUN number of a disk (last field of the H:C:T:L address)
+lun_number() {
+    local h
+    h=$(lun_attr "$1" HCTL)
+    echo "${h##*:}"
+}
+
+# One-line description of what is on a disk (used by the LUN picker)
+lun_summary() {
+    local dev="$1" mnt types parts
+    mnt=$(lsblk -nro MOUNTPOINT "$dev" 2>/dev/null | grep -m1 '[^[:space:]]' || true)
+    if [[ -n "$mnt" ]]; then
+        echo "mounted at ${mnt}"
+        return 0
+    fi
+    types=$(lsblk -nro FSTYPE "$dev" 2>/dev/null | awk 'NF' | sort -u | paste -sd, - || true)
+    parts=$(lsblk -nlo TYPE "$dev" 2>/dev/null | grep -c '^part$' || true)
+    if [[ -n "$types" ]]; then
+        echo "contains: ${types}"
+    elif [[ "${parts:-0}" -gt 0 ]]; then
+        echo "partitioned, no filesystem"
+    else
+        echo "empty - no partition table"
+    fi
+}
+
+# From a list of devices (one per line), prints the one that is the LUN chosen
+# during setup. Matches on WWN, then serial, then SCSI LUN number.
+pick_chosen_lun() {
+    local devs="$1" d count
+    count=$(grep -c . <<< "$devs" || true)
+    if [[ -z "$LUN_WWN" && -z "$LUN_SERIAL" && -z "$LUN_NUM" ]]; then
+        if [[ "$count" -eq 1 ]]; then
+            echo "$devs"
+            return 0
+        fi
+        return 1
+    fi
+    while IFS= read -r d; do
+        if [[ -z "$d" ]]; then continue; fi
+        if [[ -n "$LUN_WWN" ]]; then
+            if [[ "$(lun_attr "$d" WWN)" == "$LUN_WWN" ]]; then echo "$d"; return 0; fi
+        elif [[ -n "$LUN_SERIAL" ]]; then
+            if [[ "$(lun_attr "$d" SERIAL)" == "$LUN_SERIAL" ]]; then echo "$d"; return 0; fi
+        else
+            if [[ "$(lun_number "$d")" == "$LUN_NUM" ]]; then echo "$d"; return 0; fi
+        fi
+    done <<< "$devs"
+    return 1
+}
+
+# Lets the user choose between several LUNs on the target -> sets DEVICE_PATH
+choose_lun() {
+    local -a items=()
+    local d sz model num choice
+    for d in "${LUN_DEVS[@]}"; do
+        sz=$(lun_attr "$d" SIZE)
+        model=$(lsblk -dno VENDOR,MODEL "$d" 2>/dev/null | head -n 1 | xargs || true)
+        num=$(lun_number "$d")
+        items+=("${d}  ${sz}  ${model}  (LUN ${num:-?})|WWN $(lun_attr "$d" WWN)  ·  $(lun_summary "$d")")
+    done
+    echo
+    panel_top "This target holds ${#LUN_DEVS[@]} LUNs" "$YELLOW"
+    panel_line "Pick the one that should store the backups."
+    panel_line "${DIM}The other LUNs are not touched.${NC}"
+    panel_bottom
+    menu_select choice 0 "${items[@]}" "Quit|Nothing has been changed"
+    if [[ $choice -ge ${#LUN_DEVS[@]} ]]; then
+        quit_clean
+    fi
+    DEVICE_PATH="${LUN_DEVS[choice]}"
+    ok "LUN: ${DEVICE_PATH}"
+}
+
+# Raises the reconnect patience of the LIVE session (the node record only
+# applies at the next login). Returns 1 if there is no session to change.
+apply_live_timeout() {
+    local sid f
+    sid=$(iscsiadm -m session 2>/dev/null | awk -v t="$TARGET_IQN" '$4 == t { gsub(/\[|\]/, "", $2); print $2; exit }')
+    f="/sys/class/iscsi_session/session${sid}/recovery_tmo"
+    if [[ -n "$sid" && -w "$f" ]]; then
+        echo "$REPLACEMENT_TIMEOUT" > "$f" 2>/dev/null || return 1
+        return 0
+    fi
     return 1
 }
 
@@ -738,6 +1138,8 @@ probe_lun() {
     LUN_SIZE=$(lsblk -dnbo SIZE "$dev" 2>/dev/null | tr -d ' ' || true)
     LUN_SIZE_H=$(lsblk -dno SIZE "$dev" 2>/dev/null | tr -d ' ' || true)
     LUN_WWN=$(lsblk -dno WWN "$dev" 2>/dev/null | tr -d ' ' || true)
+    LUN_SERIAL=$(lun_attr "$dev" SERIAL)
+    LUN_NUM=$(lun_number "$dev")
     LUN_MODEL=$(lsblk -dno VENDOR,MODEL "$dev" 2>/dev/null | xargs || true)
     disc=$(cat "/sys/block/${base}/queue/discard_max_bytes" 2>/dev/null || echo 0)
     LUN_DISCARD=0
@@ -899,6 +1301,7 @@ preflight() {
     fi
     if [[ ! -t 0 || ! -t 1 ]]; then
         echo "This installer is interactive - run it directly in a terminal (not piped)." >&2
+        echo "Download it first, or use:  bash <(curl -fsSL <script-url>)" >&2
         exit 1
     fi
     touch "$LOG_FILE"
@@ -941,6 +1344,7 @@ setup_welcome() {
     panel_line "${GREEN}●${NC} Mounts it safely, monitors the connection, enables TRIM"
     panel_line "${GREEN}●${NC} Creates - or re-attaches - the PBS datastore"
     panel_line "${GREEN}●${NC} Removes the \"No valid subscription\" popup"
+    panel_line "${GREEN}●${NC} Adds a live dashboard + menu that greets you at login"
     panel_bottom
     echo
     echo "  ${WHITE}All questions come first.${NC} ${DIM}No disk is changed until you confirm the plan.${NC}"
@@ -969,6 +1373,7 @@ setup_options() {
             "Connect a Synology iSCSI LUN"
             "Create a PBS datastore"
             "Remove the subscription popup"
+            "Login screen (MOTD dashboard + menu)"
         )
         CL_HINTS=(
             "Disables the enterprise repo (needs a paid subscription) and enables the free repo"
@@ -976,15 +1381,17 @@ setup_options() {
             "Installs open-iscsi, connects, inspects and mounts the LUN"
             "Registers the storage in PBS so backups can be stored there"
             "Hides the \"No valid subscription\" message at login - kept after updates"
+            "Live status when you log in: server, Synology link, free space, backups - plus a menu"
         )
-        CL_STATE=("$DO_REPO" "$DO_UPGRADE" "$DO_ISCSI" "$DO_DS" "$DO_NAG")
+        CL_STATE=("$DO_REPO" "$DO_UPGRADE" "$DO_ISCSI" "$DO_DS" "$DO_NAG" "$DO_MOTD")
         checklist_select
         DO_REPO=${CL_STATE[0]}
         DO_UPGRADE=${CL_STATE[1]}
         DO_ISCSI=${CL_STATE[2]}
         DO_DS=${CL_STATE[3]}
         DO_NAG=${CL_STATE[4]}
-        if [[ $(( DO_REPO + DO_UPGRADE + DO_ISCSI + DO_DS + DO_NAG )) -gt 0 ]]; then
+        DO_MOTD=${CL_STATE[5]}
+        if [[ $(( DO_REPO + DO_UPGRADE + DO_ISCSI + DO_DS + DO_NAG + DO_MOTD )) -gt 0 ]]; then
             return 0
         fi
         err "Nothing selected - pick at least one option."
@@ -1004,6 +1411,7 @@ setup_tools() {
         panel_line "${GREEN}This does not touch any disk.${NC}"
         panel_bottom
         echo
+        [[ ${DO_REPO:-0} -eq 1 ]] && disable_enterprise_repos || true
         apt_update
         run_quiet "Installing open-iscsi, parted and xfsprogs" \
             "${APT_ENV[@]}" apt-get "${APT_OPTS[@]}" install open-iscsi parted xfsprogs
@@ -1157,31 +1565,61 @@ choose_target() {
     ok "Target: ${TARGET_IQN}"
 }
 
+# ask_chap [fresh]   - "fresh" = do not offer the stored login (it was just rejected)
 ask_chap() {
-    local choice
+    local fresh="${1:-}" choice mode="new" st user
+    st=$(stored_chap_state)
     echo
     echo "  ${WHITE}Authentication${NC}"
-    menu_select choice $(( CHAP_MODE == 1 ? 0 : 1 )) \
-        "CHAP - username + password (recommended)|As set on the Synology: Target › Edit › Authentication" \
-        "No authentication|Only if CHAP is disabled on the target"
-    if [[ $choice -eq 0 ]]; then
-        CHAP_MODE=1
-        ask_required CHAP_USER "CHAP username" "" "$CHAP_USER"
-        ask_secret CHAP_PASS "CHAP password"
-        if (( ${#CHAP_PASS} < 12 || ${#CHAP_PASS} > 16 )); then
-            warn "Synology CHAP passwords are normally 12-16 characters - double-check it."
-        fi
+    if [[ "$st" == "chap" && "$fresh" != "fresh" ]]; then
+        user=$(node_field "$PORTAL_IP" "$TARGET_IQN" node.session.auth.username)
+        menu_select choice 0 \
+            "Use the CHAP login already stored here (user: ${user})|Recommended - nothing has to be typed" \
+            "Enter a new CHAP login|Replaces the stored one" \
+            "No authentication|Only if CHAP is disabled on the target"
+        case "$choice" in
+            0) mode="keep" ;;
+            1) mode="new" ;;
+            *) mode="none" ;;
+        esac
     else
-        CHAP_MODE=0
-        CHAP_USER=""
-        CHAP_PASS=""
+        menu_select choice $(( CHAP_MODE == 1 ? 0 : 1 )) \
+            "CHAP - username + password (recommended)|As set on the Synology: Target › Edit › Authentication" \
+            "No authentication|Only if CHAP is disabled on the target"
+        if [[ $choice -ne 0 ]]; then mode="none"; fi
     fi
+    case "$mode" in
+        keep)
+            CHAP_MODE=1
+            CHAP_KEEP=1
+            ok "Using the stored CHAP login"
+            ;;
+        none)
+            CHAP_MODE=0
+            CHAP_KEEP=0
+            CHAP_USER=""
+            CHAP_PASS=""
+            ;;
+        *)
+            CHAP_MODE=1
+            CHAP_KEEP=0
+            ask_required CHAP_USER "CHAP username" "" "$CHAP_USER"
+            ask_secret CHAP_PASS "CHAP password"
+            if (( ${#CHAP_PASS} < 12 || ${#CHAP_PASS} > 16 )); then
+                warn "Synology CHAP passwords are normally 12-16 characters - double-check it."
+            fi
+            ;;
+    esac
 }
 
 test_login() {
     create_node_record
     apply_auth
-    node_update node.startup manual
+    # A fresh record must not log in by itself before the install; an existing
+    # one keeps whatever boot setting it already has.
+    if [[ $NODE_PREEXISTED -eq 0 ]]; then
+        node_update node.startup manual
+    fi
     echo
     run_quiet_soft "Logging in to ${TARGET_IQN##*:}" \
         timeout 30 iscsiadm -m node -T "$TARGET_IQN" -p "$PORTAL_IP" --login
@@ -1230,11 +1668,31 @@ setup_connection() {
         if session_active; then
             ok "This server is already connected to that target"
             PROBE_SESSION=0
+            case "$(stored_chap_state)" in
+                chap)
+                    CHAP_MODE=1
+                    CHAP_KEEP=1
+                    ok "Keeping the CHAP login already stored for this target"
+                    ;;
+                none)
+                    CHAP_MODE=0
+                    CHAP_KEEP=0
+                    CHAP_USER=""
+                    CHAP_PASS=""
+                    ;;
+                *)
+                    warn "No complete CHAP login is stored for this target - enter it now."
+                    echo "    ${DIM}It is saved for the next reconnect; the running connection is not touched.${NC}"
+                    ask_chap fresh
+                    ;;
+            esac
+            offer_stale_cleanup
             return 0
         fi
         ask_chap
         while true; do
             if test_login; then
+                offer_stale_cleanup
                 return 0
             fi
             show_login_error
@@ -1244,7 +1702,7 @@ setup_connection() {
                 "Choose another target|Back to the target list" \
                 "Quit|No disks have been touched"
             case "$choice" in
-                0) ask_chap ;;
+                0) ask_chap fresh ;;
                 1) : ;;
                 2) break ;;
                 *) quit_clean ;;
@@ -1277,12 +1735,13 @@ choose_filesystem() {
 }
 
 setup_lun() {
-    local choice keep_label
+    local choice keep_label devs
     while true; do
         render_setup 5
         info "Waiting for the LUN to appear..."
-        DEVICE_PATH=$(wait_for_device) || DEVICE_PATH=""
-        if [[ -n "$DEVICE_PATH" ]]; then
+        devs=$(wait_for_devices) || devs=""
+        if [[ -n "$devs" ]]; then
+            mapfile -t LUN_DEVS <<< "$devs"
             break
         fi
         err "The login worked, but no disk appeared."
@@ -1291,6 +1750,12 @@ setup_lun() {
         if [[ $choice -ne 0 ]]; then quit_clean; fi
         iscsiadm -m session --rescan >/dev/null 2>&1 || true
     done
+    if [[ ${#LUN_DEVS[@]} -gt 1 ]]; then
+        choose_lun
+        render_setup 5
+    else
+        DEVICE_PATH="${LUN_DEVS[0]}"
+    fi
     info "Inspecting the LUN ${DIM}(read-only - nothing is written)${NC}"
     probe_lun
     render_setup 5
@@ -1464,8 +1929,66 @@ setup_datastore_questions() {
     fi
 }
 
+setup_alerts() {
+    local choice def=0
+    case "$NOTIFY_MODE" in
+        url)  def=1 ;;
+        mail) def=2 ;;
+    esac
+    echo
+    panel_top "Alerts from the monitor"
+    panel_line "The monitor repairs a lost iSCSI connection by itself."
+    panel_line "It can also tell you when something is wrong - and when it is fixed."
+    panel_bottom
+    while true; do
+        menu_select choice "$def" \
+            "No alerts|The monitor only writes to /var/log/iscsi-monitor.log" \
+            "Push message / webhook|ntfy.sh, or any URL that accepts a plain POST request" \
+            "Email|Sent with this server's sendmail / postfix"
+        case "$choice" in
+            0)
+                NOTIFY_MODE="none"
+                NOTIFY_URL=""
+                NOTIFY_MAIL=""
+                break
+                ;;
+            1)
+                while true; do
+                    ask_required NOTIFY_URL "Alert URL" "e.g. https://ntfy.sh/my-secret-topic  (keep the topic name secret)" "$NOTIFY_URL"
+                    if [[ "$NOTIFY_URL" =~ ^https?://[^[:space:]]+$ ]]; then
+                        break
+                    fi
+                    err "The URL must start with http:// or https:// and contain no spaces."
+                done
+                if ! command -v curl >/dev/null 2>&1; then
+                    run_quiet "Installing curl" "${APT_ENV[@]}" apt-get "${APT_OPTS[@]}" install curl
+                fi
+                NOTIFY_MODE="url"
+                NOTIFY_MAIL=""
+                break
+                ;;
+            2)
+                if ! command -v sendmail >/dev/null 2>&1; then
+                    err "sendmail was not found on this server - set up postfix first, or use a push message."
+                    continue
+                fi
+                while true; do
+                    ask_required NOTIFY_MAIL "Email address" "where the alerts are sent" "$NOTIFY_MAIL"
+                    if [[ "$NOTIFY_MAIL" =~ ^[^[:space:]@]+@[^[:space:]@]+$ ]]; then
+                        break
+                    fi
+                    err "That does not look like an email address."
+                done
+                NOTIFY_MODE="mail"
+                NOTIFY_URL=""
+                break
+                ;;
+        esac
+    done
+}
+
 setup_mount_ds() {
-    if [[ $DO_ISCSI -eq 0 && $DO_DS -eq 0 ]]; then
+    if [[ $DO_ISCSI -eq 0 && $DO_DS -eq 0 && $DO_MOTD -eq 0 ]]; then
         return 0
     fi
     render_setup 6
@@ -1480,10 +2003,38 @@ setup_mount_ds() {
     if [[ $DO_DS -eq 1 ]]; then
         setup_datastore_questions
     fi
+    if [[ $DO_ISCSI -eq 1 ]]; then
+        setup_alerts
+    fi
+    setup_motd
+}
+
+setup_motd() {
+    local choice def=0
+    if [[ $DO_MOTD -ne 1 ]]; then
+        return 0
+    fi
+    if [[ "$MOTD_MODE" == "dashboard" ]]; then
+        def=1
+    fi
+    echo
+    panel_top "Login screen"
+    panel_line "When you log in you are met by a live dashboard: server health,"
+    panel_line "the Synology connection, free space and the latest backups."
+    panel_line "Press ${CYAN}m${NC} for a menu: live view, repair, logs and help."
+    panel_bottom
+    menu_select choice "$def" \
+        "Dashboard + menu prompt|After the dashboard press m for the menu - it waits 5 seconds, then your shell" \
+        "Dashboard only|Shows the dashboard and your shell right away - the menu is still there as: pbs-menu"
+    if [[ $choice -eq 1 ]]; then
+        MOTD_MODE="dashboard"
+    else
+        MOTD_MODE="prompt"
+    fi
 }
 
 setup_review() {
-    local choice trim_txt=""
+    local choice trim_txt="" lun_txt="" alert_txt=""
     render_setup 7
     panel_top "Your plan"
     kv "Repository" "$( [[ $DO_REPO -eq 1 ]] && echo 'switch to no-subscription' || echo 'unchanged' )"
@@ -1496,7 +2047,10 @@ setup_review() {
         else
             kv "Login" "no authentication"
         fi
-        kv "LUN" "${LUN_SIZE_H} · $( [[ $LUN_DISCARD -eq 1 ]] && echo 'TRIM supported' || echo 'no TRIM' )"
+        if [[ ${#LUN_DEVS[@]} -gt 1 ]]; then
+            lun_txt=" · LUN ${LUN_NUM:-?} (1 of ${#LUN_DEVS[@]} on this target)"
+        fi
+        kv "LUN" "${LUN_SIZE_H} · $( [[ $LUN_DISCARD -eq 1 ]] && echo 'TRIM supported' || echo 'no TRIM' )${lun_txt}"
         case "$DISK_ACTION" in
             new)     kv "Disk" "${GREEN}create GPT partition + ${FS_TYPE}${NC}" ;;
             format)  kv "Disk" "${RED}ERASE the LUN and format it as ${FS_TYPE}${NC}" ;;
@@ -1505,7 +2059,14 @@ setup_review() {
         esac
         kv "Mount path" "$MOUNT_PATH"
         if [[ $LUN_DISCARD -eq 1 ]]; then trim_txt=" · weekly TRIM"; fi
-        kv "Monitoring" "reconnect check every minute${trim_txt}"
+        kv "Monitoring" "health check + auto-repair every minute${trim_txt}"
+        kv "Resilience" "waits $(( REPLACEMENT_TIMEOUT / 60 )) min for the NAS · PBS starts after the mount"
+        case "$NOTIFY_MODE" in
+            url)  alert_txt="push message / webhook ($(sed -E 's#^(https?://[^/]+).*#\1#' <<< "$NOTIFY_URL"))" ;;
+            mail) alert_txt="email to ${NOTIFY_MAIL}" ;;
+            *)    alert_txt="none - log file only" ;;
+        esac
+        kv "Alerts" "$alert_txt"
     else
         kv "iSCSI" "no"
     fi
@@ -1521,6 +2082,7 @@ setup_review() {
         kv "Datastore" "no"
     fi
     kv "Popup" "$( [[ $DO_NAG -eq 1 ]] && echo 'remove the subscription popup' || echo 'unchanged' )"
+    kv "Login screen" "$( [[ $DO_MOTD -eq 1 ]] && echo "live dashboard (${MOTD_MODE/prompt/with menu prompt})" || echo 'unchanged' )"
     panel_bottom
     menu_select choice 0 \
         "Start the installation|Runs on its own from here - grab a coffee" \
@@ -1563,24 +2125,7 @@ step_repos() {
         return 0
     fi
     begin_step $S_REPO
-    shopt -s nullglob
-    for f in /etc/apt/sources.list.d/pbs-enterprise*.list; do
-        sed -i 's/^[[:space:]]*deb /# deb /' "$f"
-        ok "Disabled $(basename "$f")"
-    done
-    for f in /etc/apt/sources.list.d/pbs-enterprise*.sources; do
-        if grep -qi '^Enabled:' "$f"; then
-            sed -i 's/^Enabled:.*/Enabled: false/I' "$f"
-        else
-            echo "Enabled: false" >> "$f"
-        fi
-        ok "Disabled $(basename "$f")"
-    done
-    shopt -u nullglob
-    if [[ -f /etc/apt/sources.list ]] && grep -q '^[[:space:]]*deb .*pbs-enterprise' /etc/apt/sources.list; then
-        sed -i '/pbs-enterprise/s/^[[:space:]]*deb /# deb /' /etc/apt/sources.list
-        ok "Disabled the enterprise line in sources.list"
-    fi
+    disable_enterprise_repos || ok "Enterprise repository already off"
 
     if grep -rqsE '^[[:space:]]*deb .*pbs-no-subscription' /etc/apt/sources.list /etc/apt/sources.list.d/ \
         || grep -rqsE '^Components:.*pbs-no-subscription' /etc/apt/sources.list.d/; then
@@ -1620,13 +2165,15 @@ step_upgrade() {
 }
 
 step_connect() {
-    local dev_size dev_wwn
+    local dev_size dev_wwn devs
     begin_step $S_CONN
     ensure_iscsi_service
     create_node_record
     apply_auth
     node_update node.startup automatic
+    node_update node.session.timeo.replacement_timeout "$REPLACEMENT_TIMEOUT"
     ok "Only this target is set to log in automatically at boot"
+    ok "Reconnect patience: $(( REPLACEMENT_TIMEOUT / 60 )) minutes ${DIM}(survives a Synology reboot or update)${NC}"
 
     if session_active; then
         ok "Session already active"
@@ -1638,10 +2185,18 @@ step_connect() {
         fi
     fi
 
+    if apply_live_timeout; then
+        ok "The running session uses the longer reconnect patience right away"
+    fi
+
     info "Waiting for the disk to appear..."
-    DEVICE_PATH=$(wait_for_device) || DEVICE_PATH=""
-    if [[ -z "$DEVICE_PATH" ]]; then
+    devs=$(wait_for_devices) || devs=""
+    if [[ -z "$devs" ]]; then
         fatal "Could not detect a running iSCSI disk for target ${TARGET_IQN}."
+    fi
+    DEVICE_PATH=$(pick_chosen_lun "$devs") || DEVICE_PATH=""
+    if [[ -z "$DEVICE_PATH" ]]; then
+        fatal "The LUN chosen during setup (${LUN_WWN:-LUN ${LUN_NUM:-?}}) is no longer offered by the target - stopping to protect your data."
     fi
 
     # Make sure this is the very same LUN that was inspected during setup
@@ -1786,22 +2341,35 @@ step_mount() {
     finish_step $S_MOUNT "$MOUNT_PATH ($(df -h --output=size "$MOUNT_PATH" | tail -n 1 | tr -d ' '))"
 }
 
-step_monitor() {
-    local service_name cron_job tmp_cron detail="reconnect check every minute"
-    begin_step $S_MON
+# Writes the monitor script to $1. Target, portal and mount path are baked in;
+# the alert settings live in a separate root-only config file.
+write_monitor_script() {
+    local dest="$1" service_name
     service_name=$(basename "$MOUNT_PATH")
-    CHECK_ISCSI_SCRIPT="/usr/local/bin/check-iscsi-session-${service_name}.sh"
     {
         echo '#!/bin/bash'
-        echo "# Auto-generated iSCSI session and mount monitor for $service_name"
+        echo "# Auto-generated iSCSI session, mount and health monitor for $service_name (pbs-post-install v${VERSION})"
         printf 'TARGET=%q\n' "$TARGET_IQN"
         printf 'PORTAL=%q\n' "$PORTAL_IP"
         printf 'MOUNT_PATH=%q\n' "$MOUNT_PATH"
         printf 'LOCK_FILE=%q\n' "/run/lock/iscsi-monitor-${service_name}.lock"
+        printf 'STATE_FILE=%q\n' "/run/iscsi-monitor-${service_name}.state"
+        printf 'CONF_FILE=%q\n' "/etc/pbs-iscsi-monitor-${service_name}.conf"
         cat <<'MONITOR_EOF'
 LOG_FILE="/var/log/iscsi-monitor.log"
+WRITE_TEST_SECS=20      # a write that takes longer = the storage is not answering
+REPAIR_COOLDOWN=300     # at most one automatic repair every 5 minutes
+RESTART_PBS=1           # restart the PBS services after a successful repair
+AUTH_RETRY=900          # after a rejected login (wrong/missing CHAP) try only every 15 minutes
+NOTIFY_MODE="none"
+NOTIFY_URL=""
+NOTIFY_MAIL=""
+# shellcheck disable=SC1090
+[ -r "$CONF_FILE" ] && . "$CONF_FILE"
+AUTH_FILE="${STATE_FILE}.authfail"
 
-# Never run two copies at once (cron fires every minute)
+# Never run two copies at once (cron fires every minute). A write test that is
+# stuck on dead storage keeps this lock, so runs can never pile up behind it.
 exec 9>"$LOCK_FILE"
 flock -n 9 || exit 0
 
@@ -1809,42 +2377,237 @@ log_message() {
     echo "$(date '+%Y-%m-%d %H:%M:%S'): $1" >> "$LOG_FILE"
 }
 
-check_and_restore_mount() {
-    if ! mountpoint -q "$MOUNT_PATH" 2>/dev/null; then
-        log_message "Mount point $MOUNT_PATH not mounted. Attempting to mount..."
-        # Timeout so a hanging mount can never block the monitor
-        if timeout 60 mount "$MOUNT_PATH" 2>/dev/null; then
-            log_message "Successfully mounted $MOUNT_PATH"
-        else
-            log_message "Failed to mount $MOUNT_PATH"
-        fi
-    fi
+notify() {
+    case "$NOTIFY_MODE" in
+        url)
+            if [ -n "$NOTIFY_URL" ]; then
+                timeout 20 curl -fsS -m 15 -H "Title: $1" -d "$2" "$NOTIFY_URL" >/dev/null 2>&1 \
+                    || log_message "Could not send the alert (webhook)"
+            fi
+            ;;
+        mail)
+            if [ -n "$NOTIFY_MAIL" ]; then
+                printf 'To: %s\nSubject: %s\n\n%s\n' "$NOTIFY_MAIL" "$1" "$2" | timeout 20 sendmail -t >/dev/null 2>&1 \
+                    || log_message "Could not send the alert (email)"
+            fi
+            ;;
+    esac
+    return 0
 }
 
 # Exact IQN match (field 4 of "iscsiadm -m session")
-if ! iscsiadm -m session 2>/dev/null | awk -v t="$TARGET" '$4 == t { f = 1 } END { exit !f }'; then
-    log_message "iSCSI session for $TARGET not found. Attempting to reconnect..."
-    # Timeout so a login to an unreachable Synology can never block the monitor
-    if timeout 30 iscsiadm -m node -T "$TARGET" -p "$PORTAL" --login 2>/dev/null; then
-        log_message "Successfully reconnected to $TARGET"
-        sleep 2
-        check_and_restore_mount
+session_present() {
+    timeout 20 iscsiadm -m session 2>/dev/null | awk -v t="$TARGET" '$4 == t { f = 1 } END { exit !f }'
+}
+
+# Logs in. 0 = connected, 24 = the Synology rejected the login (authentication),
+# anything else = failed. A rejected login is NOT retried every minute: repeating
+# a wrong password floods the Synology's log and can lock the account.
+do_login() {
+    local rc=0 out
+    out=$(timeout 30 iscsiadm -m node -T "$TARGET" -p "$PORTAL" --login 2>&1) || rc=$?
+    if [ "$rc" -eq 0 ] || [ "$rc" -eq 15 ]; then
+        rm -f "$AUTH_FILE"
+        return 0
+    fi
+    if [ "$rc" -eq 24 ] || printf '%s' "$out" | grep -qiE 'authentication failed|authorization failure|failed to authenticate'; then
+        date +%s > "$AUTH_FILE"
+        log_message "Login REJECTED by the Synology: the stored CHAP username/password is missing or wrong."
+        log_message "Not retrying for $(( AUTH_RETRY / 60 )) minutes. Fix it with:  pbs-post-install.sh --fix-login  (or run the installer with --fix-login)"
+        return 24
+    fi
+    return 1
+}
+
+# findmnt only reads /proc/self/mountinfo, so it can never hang on dead storage
+is_mounted() {
+    findmnt -rn -M "$MOUNT_PATH" >/dev/null 2>&1
+}
+
+mount_is_readonly() {
+    local o
+    o=$(findmnt -rn -M "$MOUNT_PATH" -o OPTIONS 2>/dev/null)
+    case ",${o}," in
+        *,ro,*) return 0 ;;
+    esac
+    return 1
+}
+
+# Creates, syncs and removes a small file on the LUN.
+# 0 = ok, 2 = the write failed, 3 = no answer within WRITE_TEST_SECS
+write_test() {
+    local f="$MOUNT_PATH/.pbs-monitor-test" pid i
+    ( : > "$f" && sync -d "$f" && rm -f "$f" ) 2>/dev/null &
+    pid=$!
+    for i in $(seq 1 "$WRITE_TEST_SECS"); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            break
+        fi
+        sleep 1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        return 3
+    fi
+    if wait "$pid"; then
+        return 0
+    fi
+    return 2
+}
+
+# 0 = healthy, 1 = storage not answering (wait: a repair would hang too), 2 = broken
+check_health() {
+    local rc=0
+    if ! is_mounted; then
+        return 2
+    fi
+    if mount_is_readonly; then
+        log_message "$MOUNT_PATH is mounted read-only (the filesystem hit an I/O error)"
+        return 2
+    fi
+    write_test || rc=$?
+    case "$rc" in
+        0) return 0 ;;
+        3)
+            log_message "Write test on $MOUNT_PATH got no answer within ${WRITE_TEST_SECS}s - the Synology may be restarting"
+            return 1
+            ;;
+        *)
+            log_message "Write test on $MOUNT_PATH failed"
+            return 2
+            ;;
+    esac
+}
+
+repair() {
+    local now last i
+    now=$(date +%s)
+    last=$(cat "${STATE_FILE}.repair" 2>/dev/null || echo 0)
+    if [ $(( now - last )) -lt "$REPAIR_COOLDOWN" ]; then
+        log_message "Repair skipped - the last attempt was less than $(( REPAIR_COOLDOWN / 60 )) minutes ago"
+        return 1
+    fi
+    echo "$now" > "${STATE_FILE}.repair"
+    log_message "Repairing: unmount > logout > login > mount"
+    if is_mounted; then
+        timeout -k 5 60 umount "$MOUNT_PATH" >/dev/null 2>&1 \
+            || timeout -k 5 30 umount -l "$MOUNT_PATH" >/dev/null 2>&1
+    fi
+    timeout 30 iscsiadm -m node -T "$TARGET" -p "$PORTAL" --logout >/dev/null 2>&1
+    sleep 2
+    if ! do_login; then
+        log_message "Repair failed: could not log in to $TARGET"
+        return 1
+    fi
+    udevadm settle --timeout=20 >/dev/null 2>&1
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        if timeout -k 5 60 mount "$MOUNT_PATH" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 3
+    done
+    if ! is_mounted || mount_is_readonly; then
+        log_message "Repair failed: $MOUNT_PATH could not be mounted read-write"
+        return 1
+    fi
+    log_message "Repair succeeded: $MOUNT_PATH is mounted again"
+    if [ "$RESTART_PBS" = "1" ]; then
+        if timeout 90 systemctl restart proxmox-backup proxmox-backup-proxy >/dev/null 2>&1; then
+            log_message "Restarted the PBS services"
+        else
+            log_message "Could not restart the PBS services"
+        fi
+    fi
+    notify "PBS storage repaired on $(hostname)" "The iSCSI connection to $TARGET was repaired automatically and $MOUNT_PATH is mounted again."
+    return 0
+}
+
+problem=0
+
+if ! session_present; then
+    last_auth=$(cat "$AUTH_FILE" 2>/dev/null || echo 0)
+    if [ $(( $(date +%s) - last_auth )) -lt "$AUTH_RETRY" ]; then
+        # The login was rejected recently - stay quiet and do not try again yet
+        problem=1
     else
-        log_message "Failed to reconnect to $TARGET"
+        log_message "iSCSI session for $TARGET not found. Attempting to reconnect..."
+        # Timeout so a login to an unreachable Synology can never block the monitor
+        if do_login; then
+            log_message "Successfully reconnected to $TARGET"
+            udevadm settle --timeout=20 >/dev/null 2>&1
+            sleep 2
+        else
+            log_message "Failed to reconnect to $TARGET"
+            problem=1
+        fi
     fi
 else
-    # Session exists - check its state ("iSCSI Session State: LOGGED_IN" when healthy)
-    session_state=$(iscsiadm -m session -P 3 2>/dev/null | awk -v t="$TARGET" '
+    rm -f "$AUTH_FILE"
+    # Session exists - "iSCSI Session State: LOGGED_IN" when healthy
+    session_state=$(timeout 20 iscsiadm -m session -P 3 2>/dev/null | awk -v t="$TARGET" '
         /^[[:space:]]*Target:/ { in_t = ($2 == t) }
         in_t && /iSCSI Session State:/ { print $NF; exit }
     ')
-    if [[ -n "$session_state" && "$session_state" != "LOGGED_IN" ]]; then
+    if [ -n "$session_state" ] && [ "$session_state" != "LOGGED_IN" ]; then
         log_message "iSCSI session for $TARGET exists but state is $session_state"
     fi
-    check_and_restore_mount
+fi
+
+if [ "$problem" -eq 0 ] && ! is_mounted; then
+    log_message "Mount point $MOUNT_PATH not mounted. Attempting to mount..."
+    # Timeout so a hanging mount can never block the monitor
+    if timeout -k 5 60 mount "$MOUNT_PATH" >/dev/null 2>&1; then
+        log_message "Successfully mounted $MOUNT_PATH"
+    else
+        log_message "Failed to mount $MOUNT_PATH"
+        problem=1
+    fi
+fi
+
+if [ "$problem" -eq 0 ]; then
+    check_health
+    case $? in
+        0) ;;
+        1) problem=1 ;;
+        *) repair || problem=1 ;;
+    esac
+fi
+
+# Alerts only when the state changes (no message every minute)
+prev=$(cat "$STATE_FILE" 2>/dev/null || echo ok)
+if [ "$problem" -eq 1 ]; then cur=bad; else cur=ok; fi
+echo "$cur" > "$STATE_FILE"
+if [ "$prev" = "ok" ] && [ "$cur" = "bad" ]; then
+    notify "PBS storage problem on $(hostname)" "The iSCSI storage ($TARGET, mounted at $MOUNT_PATH) is not responding or could not be reconnected. Details: $LOG_FILE"
+elif [ "$prev" = "bad" ] && [ "$cur" = "ok" ]; then
+    log_message "Storage is healthy again"
+    notify "PBS storage recovered on $(hostname)" "The iSCSI storage ($TARGET) is healthy again."
 fi
 MONITOR_EOF
-    } > "$CHECK_ISCSI_SCRIPT"
+    } > "$dest"
+}
+
+# Sends one test message with the alert settings chosen in setup
+send_test_alert() {
+    local text="Test alert from ${HOST_NAME:-this server}: the iSCSI monitor can reach you."
+    case "$NOTIFY_MODE" in
+        url)
+            timeout 20 curl -fsS -m 15 -H "Title: PBS installer test" -d "$text" "$NOTIFY_URL" >/dev/null 2>&1
+            ;;
+        mail)
+            printf 'To: %s\nSubject: %s\n\n%s\n' "$NOTIFY_MAIL" "PBS installer test" "$text" \
+                | timeout 20 sendmail -t >/dev/null 2>&1
+            ;;
+        *) return 0 ;;
+    esac
+}
+
+step_monitor() {
+    local service_name cron_job tmp_cron detail="health check + auto-repair every minute"
+    local mount_unit svc dir conf
+    begin_step $S_MON
+    service_name=$(basename "$MOUNT_PATH")
+    CHECK_ISCSI_SCRIPT="/usr/local/bin/check-iscsi-session-${service_name}.sh"
+    write_monitor_script "$CHECK_ISCSI_SCRIPT"
     chmod +x "$CHECK_ISCSI_SCRIPT"
 
     cron_job="*/1 * * * * $CHECK_ISCSI_SCRIPT # iSCSI monitor for $service_name"
@@ -1854,6 +2617,65 @@ MONITOR_EOF
     crontab "$tmp_cron"
     rm -f "$tmp_cron"
     ok "Monitor installed: ${CHECK_ISCSI_SCRIPT}"
+    ok "It checks the session, the mount and a test write - and repairs by itself"
+
+    # Alert settings (root-only file; the URL may contain a secret topic name)
+    conf="/etc/pbs-iscsi-monitor-${service_name}.conf"
+    (
+        umask 077
+        {
+            printf 'NOTIFY_MODE=%q\n' "$NOTIFY_MODE"
+            printf 'NOTIFY_URL=%q\n' "$NOTIFY_URL"
+            printf 'NOTIFY_MAIL=%q\n' "$NOTIFY_MAIL"
+        } > "$conf"
+    )
+    chmod 600 "$conf"
+    if [[ "$NOTIFY_MODE" != "none" ]]; then
+        if send_test_alert; then
+            ok "Test alert sent - check that it arrived"
+            detail+=" · alerts on"
+        else
+            warn "The test alert could not be sent - check the address and this server's internet / mail setup"
+        fi
+    fi
+
+    cat > /etc/logrotate.d/pbs-iscsi-monitor <<'LOGROTATE_EOF'
+/var/log/iscsi-monitor.log {
+    weekly
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    notifempty
+}
+LOGROTATE_EOF
+    ok "Monitor log rotation: weekly, 8 weeks kept"
+
+    # Start PBS only after the iSCSI mount has been tried. "Wants" (not "Requires"),
+    # so a dead NAS never keeps PBS - and its web UI - from starting.
+    mount_unit=$(systemd-escape --path --suffix=mount "$MOUNT_PATH")
+    for svc in proxmox-backup proxmox-backup-proxy; do
+        dir="/etc/systemd/system/${svc}.service.d"
+        mkdir -p "$dir"
+        cat > "${dir}/10-iscsi-${service_name}.conf" <<EOF
+# Written by pbs-post-install: start PBS after the iSCSI disk is mounted.
+[Unit]
+Wants=${mount_unit}
+After=${mount_unit}
+EOF
+    done
+    systemctl daemon-reload
+    ok "PBS now starts after ${MOUNT_PATH} is mounted ${DIM}(boot order)${NC}"
+    detail+=" · boot order"
+
+    # Keep a copy of this script, so "--status" works from anywhere
+    SELF_CMD="re-run the installer with --status"
+    if [[ -f "$0" ]]; then
+        if [[ "$0" -ef /usr/local/sbin/pbs-post-install.sh ]] || cp "$0" /usr/local/sbin/pbs-post-install.sh 2>/dev/null; then
+            chmod 755 /usr/local/sbin/pbs-post-install.sh
+            SELF_CMD="pbs-post-install.sh --status"
+        fi
+    fi
 
     if [[ $LUN_DISCARD -eq 1 ]]; then
         run_quiet_soft "Enabling weekly TRIM (space reclamation)" systemctl enable --now fstrim.timer
@@ -1870,6 +2692,952 @@ MONITOR_EOF
         fi
     fi
     finish_step $S_MON "$detail"
+}
+
+# ===========================================================================
+# LOGIN SCREEN (MOTD)  - dashboard + menu shown when someone logs in
+# ===========================================================================
+write_motd_script() {
+    local dest="$1"
+    {
+        echo '#!/bin/bash'
+        printf 'PBS_MOTD_VERSION=%q\n' "$VERSION"
+        cat <<'MOTD_EOF'
+# pbs-motd - login dashboard, live view and menu for Proxmox Backup Server.
+# Written by pbs-post-install. Read-only: it never changes storage by itself.
+#   pbs-motd              show the dashboard
+#   pbs-motd --login      what runs at login (honours MODE in /etc/pbs-motd.conf)
+#   pbs-motd --watch      live view, refreshes every 3 seconds
+#   pbs-motd --menu       interactive menu   (also: pbs-menu)
+#   pbs-motd --help       key commands       (also: pbs-help)
+export LC_ALL=C.UTF-8
+CONF=/etc/pbs-motd.conf
+MODE="prompt"          # off | dashboard | prompt
+PROMPT_SECS=5
+if [ -r "$CONF" ] && [ "$(stat -c %u "$CONF" 2>/dev/null)" = "0" ]; then
+    # shellcheck disable=SC1090
+    . "$CONF"
+fi
+INSTALLER=/usr/local/sbin/pbs-post-install.sh
+DS_CFG="${DS_CFG:-/etc/proxmox-backup/datastore.cfg}"
+TASK_DIR=/var/log/proxmox-backup/tasks
+MON_LOG=/var/log/iscsi-monitor.log
+UPD_FILE=/var/lib/pbs-motd/updates
+
+# ---------------------------------------------------------------- colours
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    RED=$'\e[1;31m'; GREEN=$'\e[1;32m'; YELLOW=$'\e[1;33m'; BLUE=$'\e[1;34m'
+    CYAN=$'\e[1;36m'; WHITE=$'\e[1;37m'; DIM=$'\e[2m'; NC=$'\e[0m'
+    if [ "$(tput colors 2>/dev/null || echo 8)" -ge 256 ]; then
+        GRAD=($'\e[38;5;51m' $'\e[38;5;45m' $'\e[38;5;39m' $'\e[38;5;33m' $'\e[38;5;27m' $'\e[38;5;21m')
+    else
+        GRAD=("$CYAN" "$CYAN" "$CYAN" "$BLUE" "$BLUE" "$BLUE")
+    fi
+else
+    RED=""; GREEN=""; YELLOW=""; BLUE=""; CYAN=""; WHITE=""; DIM=""; NC=""
+    GRAD=("" "" "" "" "" "")
+fi
+PANEL_C="$BLUE"
+PROBLEMS=0
+WARNINGS=0
+
+term_cols() {
+    local c
+    c=$(tput cols 2>/dev/null || echo 80)
+    case "$c" in ''|*[!0-9]*) c=80 ;; esac
+    echo "$c"
+}
+COLS=$(term_cols)
+
+trunc() {
+    local s="$1" w="$2"
+    [ "$w" -lt 4 ] && w=4
+    if [ "${#s}" -gt "$w" ]; then printf '%s…' "${s:0:w-1}"; else printf '%s' "$s"; fi
+}
+
+panel_top()    { PANEL_C="${2:-$BLUE}"; printf '  %s╭─%s %s%s%s\n' "$PANEL_C" "$NC" "$WHITE" "$1" "$NC"; }
+panel_line()   { printf '  %s│%s %s\n' "$PANEL_C" "$NC" "$*"; }
+panel_blank()  { printf '  %s│%s\n' "$PANEL_C" "$NC"; }
+panel_bottom() { printf '  %s╰─%s\n' "$PANEL_C" "$NC"; PANEL_C="$BLUE"; }
+kv()           { printf '  %s│%s %s%-14s%s %s\n' "$PANEL_C" "$NC" "$DIM" "$1" "$NC" "$2"; }
+st_info() { kv "$1" "$2"; }
+st_good() { kv "$1" "${GREEN}✔${NC} $2"; }
+st_warn() { kv "$1" "${YELLOW}⚠ $2${NC}"; WARNINGS=$(( WARNINGS + 1 )); }
+st_bad()  { kv "$1" "${RED}✘ $2${NC}"; PROBLEMS=$(( PROBLEMS + 1 )); }
+
+uptime_secs() { cut -d' ' -f1 /proc/uptime 2>/dev/null | cut -d. -f1; }
+
+# Like st_bad, but only a warning in the first minutes after a boot: the iSCSI link and the
+# mount are still being set up (the monitor connects them within a minute)
+st_down() {
+    if [ "$(uptime_secs)" -lt 240 ]; then
+        st_warn "$1" "$2  ${DIM}(just booted - connecting, refresh in a minute)${NC}"
+    else
+        st_bad "$1" "$2"
+    fi
+}
+
+# bar PERCENT [WIDTH]   yellow from 85 %, red from 95 %
+bar() {
+    local pct="$1" width="${2:-24}" filled colour="$GREEN" full empty
+    case "$pct" in ''|*[!0-9]*) pct=0 ;; esac
+    [ "$pct" -gt 100 ] && pct=100
+    filled=$(( pct * width / 100 ))
+    if [ "$pct" -ge 95 ]; then colour="$RED"; elif [ "$pct" -ge 85 ]; then colour="$YELLOW"; fi
+    full=$(printf '%*s' "$filled" '' | sed 's/ /█/g')
+    empty=$(printf '%*s' $(( width - filled )) '' | sed 's/ /░/g')
+    printf '%s%s%s%s%s %s%3d%%%s' "$colour" "$full" "$DIM" "$empty" "$NC" "$colour" "$pct" "$NC"
+}
+
+hb() { numfmt --to=iec --suffix=B "$1" 2>/dev/null || echo "${1}B"; }
+
+age() {   # seconds -> "5m ago"
+    local s="$1"
+    if [ "$s" -lt 90 ]; then echo "${s}s ago"
+    elif [ "$s" -lt 5400 ]; then echo "$(( (s + 30) / 60 ))m ago"
+    elif [ "$s" -lt 129600 ]; then echo "$(( (s + 1800) / 3600 ))h ago"
+    else echo "$(( s / 86400 ))d ago"; fi
+}
+
+# ---------------------------------------------------------------- data
+SESS1=""; SESS3=""
+gather_sessions() {
+    SESS1=$(timeout 10 iscsiadm -m session 2>/dev/null)
+    SESS3=$(timeout 10 iscsiadm -m session -P 3 2>/dev/null)
+}
+
+panel_server() {
+    local os kernel up load ncpu mt ma mpct rsz rused rpct d h m upd stamp n=0
+    os=$( . /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-Linux}" )
+    kernel=$(uname -r)
+    up=$(cut -d' ' -f1 /proc/uptime | cut -d. -f1)
+    d=$(( up / 86400 )); h=$(( up % 86400 / 3600 )); m=$(( up % 3600 / 60 ))
+    load=$(cut -d' ' -f1-3 /proc/loadavg)
+    ncpu=$(nproc 2>/dev/null || echo 1)
+    mt=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+    ma=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+    mpct=0
+    [ "${mt:-0}" -gt 0 ] && mpct=$(( (mt - ma) * 100 / mt ))
+    read -r rsz rused < <(timeout 3 df -B1 --output=size,used / 2>/dev/null | tail -n 1)
+    rpct=0
+    [ "${rsz:-0}" -gt 0 ] && rpct=$(( rused * 100 / rsz ))
+
+    panel_top "Server"
+    kv "System" "${os} ${DIM}· kernel ${kernel}${NC}"
+    kv "Uptime" "$( [ "$d" -gt 0 ] && echo "${d}d " )${h}h ${m}m   ${DIM}load ${load}  (${ncpu} cores)${NC}"
+    kv "Memory" "$(bar "$mpct")  ${DIM}$(hb $(( (mt - ma) * 1024 ))) of $(hb $(( mt * 1024 )))${NC}"
+    kv "System disk" "$(bar "$rpct")  ${DIM}$(hb "${rused:-0}") of $(hb "${rsz:-0}")${NC}"
+    if [ -r "$UPD_FILE" ]; then
+        IFS='|' read -r upd stamp < "$UPD_FILE"
+        case "$upd" in
+            ''|*[!0-9]*) ;;
+            0) st_good "Updates" "up to date ${DIM}(checked $(age $(( $(date +%s) - ${stamp:-0} ))))${NC}" ;;
+            *) kv "Updates" "${YELLOW}${upd} package(s) can be upgraded${NC}   ${DIM}apt update && apt full-upgrade${NC}" ;;
+        esac
+    fi
+    if [ -f /var/run/reboot-required ]; then
+        kv "Reboot" "${YELLOW}needed to finish updates${NC}"
+    fi
+    panel_bottom
+}
+
+panel_iscsi() {
+    local script="$1" TARGET="" PORTAL="" MOUNT_PATH="" STATE_FILE=""
+    local sname state disk sid rt src fstype opts size used avail pct dev dsize tmo
+    local auth_file last events cutoff ago disc dd
+    # shellcheck disable=SC1090
+    source <(grep -E '^(TARGET|PORTAL|MOUNT_PATH|STATE_FILE)=' "$script" 2>/dev/null)
+    [ -z "$TARGET" ] || [ -z "$MOUNT_PATH" ] && return 0
+    sname=$(basename "$MOUNT_PATH")
+    echo
+    panel_top "iSCSI storage · ${MOUNT_PATH}"
+    st_info "Synology" "${PORTAL%%:*}   ${DIM}${TARGET##*:}${NC}"
+
+    # --- session ---
+    state=$(awk -v t="$TARGET" '/^[[:space:]]*Target:/ { in_t = ($2 == t) } in_t && /iSCSI Session State:/ { print $NF; exit }' <<< "$SESS3")
+    sid=$(awk -v t="$TARGET" '$4 == t { gsub(/\[|\]/, "", $2); print $2; exit }' <<< "$SESS1")
+    disk=$(awk -v t="$TARGET" '/^[[:space:]]*Target:/ { in_t = ($2 == t) } in_t && /Attached scsi disk/ { print $4; exit }' <<< "$SESS3")
+    auth_file="${STATE_FILE}.authfail"
+    if [ -n "$sid" ]; then
+        if [ -z "$state" ] || [ "$state" = "LOGGED_IN" ]; then
+            tmo=$(cat "/sys/class/iscsi_session/session${sid}/recovery_tmo" 2>/dev/null)
+            st_good "Connection" "connected${tmo:+ ${DIM}· waits $(( tmo / 60 )) min for the NAS${NC}}"
+        else
+            st_bad "Connection" "${state} - the link is down or recovering"
+        fi
+    elif [ -f "$auth_file" ]; then
+        st_bad "Connection" "not connected - the Synology REJECTED the CHAP login   ${DIM}pbs-post-install.sh --fix-login${NC}"
+    else
+        st_down "Connection" "not connected"
+    fi
+
+    # --- mount ---
+    src=$(findmnt -rn -M "$MOUNT_PATH" -o SOURCE 2>/dev/null)
+    if [ -z "$src" ]; then
+        st_down "Mount" "not mounted"
+    else
+        fstype=$(findmnt -rn -M "$MOUNT_PATH" -o FSTYPE 2>/dev/null)
+        opts=$(findmnt -rn -M "$MOUNT_PATH" -o OPTIONS 2>/dev/null)
+        dsize=$(timeout 3 lsblk -bdno SIZE "$src" 2>/dev/null | head -n 1)
+        dev="${src}${dsize:+ · $(hb "$dsize")} · ${fstype}"
+        case ",${opts}," in
+            *,ro,*) st_bad "Mount" "READ-ONLY - ${dev} hit an I/O error" ;;
+            *)      st_good "Mount" "${dev} · read-write" ;;
+        esac
+        read -r size used avail < <(timeout 3 df -B1 --output=size,used,avail "$MOUNT_PATH" 2>/dev/null | tail -n 1)
+        case "${size:-x}" in
+            ''|*[!0-9]*) st_warn "Space" "df did not answer - the storage may be hanging" ;;
+            *)
+                pct=0
+                [ "$size" -gt 0 ] && pct=$(( used * 100 / size ))
+                kv "Space" "$(bar "$pct" 30)"
+                kv "" "${WHITE}$(hb "$avail")${NC} free  ${DIM}· $(hb "$used") used of $(hb "$size")${NC}"
+                if [ "$pct" -ge 95 ]; then
+                    st_bad "" "almost full - backups will fail"
+                elif [ "$pct" -ge 85 ]; then
+                    st_warn "" "getting full - check prune and garbage collection"
+                fi
+                ;;
+        esac
+        # TRIM
+        dd=$(basename "$(lsblk -no PKNAME "$src" 2>/dev/null | head -n 1)")
+        [ -z "$dd" ] || [ "$dd" = "." ] && dd=$(basename "$src")
+        disc=$(cat "/sys/block/${dd}/queue/discard_max_bytes" 2>/dev/null || echo 0)
+        if [ "${disc:-0}" -gt 0 ] 2>/dev/null; then
+            if timeout 5 systemctl is-active --quiet fstrim.timer 2>/dev/null; then
+                st_info "TRIM" "weekly - deleted backups give space back to the Synology"
+            else
+                st_warn "TRIM" "supported, but fstrim.timer is not running"
+            fi
+        else
+            st_info "TRIM" "${DIM}not supported by this LUN${NC}"
+        fi
+    fi
+
+    # --- monitor ---
+    if crontab -l 2>/dev/null | grep -qF "$script"; then
+        ago=""
+        if [ -f "$STATE_FILE" ]; then
+            ago=" ${DIM}· last check $(age $(( $(date +%s) - $(stat -c %Y "$STATE_FILE") )))${NC}"
+        fi
+        st_good "Monitor" "checks every minute, repairs by itself${ago}"
+    else
+        st_bad "Monitor" "the cron job is missing"
+    fi
+    cutoff=$(date -d '24 hours ago' '+%F %T')
+    events=0
+    if [ -r "$MON_LOG" ]; then
+        events=$(awk -v c="$cutoff" 'substr($0, 1, 19) >= c' "$MON_LOG" \
+            | grep -cE 'Failed|failed|Repairing|read-only|no answer|state is|REJECTED' || true)
+        last=$(tail -n 1 "$MON_LOG" 2>/dev/null)
+    fi
+    if [ "${events:-0}" -gt 0 ]; then
+        st_warn "Last 24 hours" "${events} problem event(s)   ${DIM}pbs-menu › Monitor log${NC}"
+        [ -n "$last" ] && kv "Last log line" "${DIM}$(trunc "$last" $(( COLS - 22 )))${NC}"
+    else
+        st_good "Last 24 hours" "no problems logged"
+    fi
+    panel_bottom
+}
+
+# Name | path of every datastore
+list_datastores() {
+    awk '
+        /^datastore:/ { name = $2 }
+        $1 == "path" && name != "" { print name "|" $2; name = "" }
+    ' "$DS_CFG" 2>/dev/null
+}
+
+panel_datastore() {
+    local line name path running n=0 types t
+    local -a ds=()
+    mapfile -t ds < <(list_datastores)
+    echo
+    panel_top "Backups"
+    if [ "${#ds[@]}" -eq 0 ]; then
+        kv "Datastore" "${DIM}none yet${NC}"
+    else
+        for line in "${ds[@]}"; do
+            name="${line%%|*}"; path="${line#*|}"
+            kv "Datastore" "${WHITE}${name}${NC}  ${DIM}${path}${NC}"
+        done
+    fi
+    # services
+    local p1 p2
+    p1=$(timeout 5 systemctl is-active proxmox-backup 2>/dev/null)
+    p2=$(timeout 5 systemctl is-active proxmox-backup-proxy 2>/dev/null)
+    if [ "$p1" = "active" ] && [ "$p2" = "active" ]; then
+        st_good "PBS services" "running ${DIM}· web UI https://${IP:-<server-ip>}:8007${NC}"
+    else
+        st_bad "PBS services" "not running (api: ${p1:-?}, proxy: ${p2:-?})   ${DIM}pbs-menu › Services${NC}"
+    fi
+    # running tasks
+    if [ -r "$TASK_DIR/active" ]; then
+        n=$(grep -c '^UPID:' "$TASK_DIR/active" 2>/dev/null || true)
+        if [ "${n:-0}" -gt 0 ]; then
+            types=$(grep '^UPID:' "$TASK_DIR/active" | awk -F: '{print $7}' | sort | uniq -c | awk '{printf "%s%s×%s", (NR>1?", ":""), $1, $2}')
+            st_info "Running now" "${CYAN}${n} task(s)${NC} ${DIM}${types}${NC}"
+        fi
+    fi
+    # last finished tasks (best effort: format "UPID:...:type:id:user: ENDTIME-HEX STATUS")
+    if [ -r "$TASK_DIR/archive" ]; then
+        local cat hex status end now col
+        now=$(date +%s)
+        while IFS='|' read -r cat hex status; do
+            [ -z "$cat" ] && continue
+            case "$hex" in ''|*[!0-9A-Fa-f]*) continue ;; esac
+            end=$(( 16#$hex ))
+            case "$status" in
+                OK*)       col="$GREEN" ;;
+                WARNINGS*) col="$YELLOW" ;;
+                *)         col="$RED" ;;
+            esac
+            kv "Last ${cat}" "${col}$(trunc "$status" 36)${NC} ${DIM}· $(age $(( now - end )))${NC}"
+        done < <(tail -n 800 "$TASK_DIR/archive" 2>/dev/null | awk '
+            {
+                n = split($1, a, ":"); t = a[7]; c = ""
+                if (t == "backup") c = "backup"
+                else if (t == "garbage_collection") c = "GC"
+                else if (t ~ /^verif/) c = "verify"
+                else if (t ~ /^prune/) c = "prune"
+                else if (t ~ /^sync|^pull|^push/) c = "sync"
+                if (c == "") next
+                st = $3; for (i = 4; i <= NF; i++) st = st " " $i
+                last[c] = c "|" $2 "|" st
+            }
+            END {
+                split("backup,GC,verify,prune,sync", o, ",")
+                for (i = 1; i <= 5; i++) if (o[i] in last) print last[o[i]]
+            }')
+    fi
+    panel_bottom
+}
+
+panel_keys() {
+    echo
+    panel_top "Quick keys" "$CYAN"
+    panel_line "${CYAN}pbs-menu${NC}  menu     ${CYAN}pbs-help${NC}  key commands     ${CYAN}pbs-motd --watch${NC}  live view"
+    if [ -x "$INSTALLER" ]; then
+        panel_line "${CYAN}pbs-post-install.sh --status${NC}  full health check     ${CYAN}--fix-login${NC}  CHAP login"
+    fi
+    panel_bottom
+}
+
+# ---------------------------------------------------------------- dashboard
+banner() {
+    local pill="$1" i host ver
+    local -a art=(
+        "██████╗ ██████╗ ███████╗"
+        "██╔══██╗██╔══██╗██╔════╝"
+        "██████╔╝██████╔╝███████╗"
+        "██╔═══╝ ██╔══██╗╚════██║"
+        "██║     ██████╔╝███████║"
+        "╚═╝     ╚═════╝ ╚══════╝"
+    )
+    host=$(hostname -s 2>/dev/null || hostname)
+    ver=$(dpkg-query -W -f='${Version}' proxmox-backup-server 2>/dev/null)
+    local -a side=(
+        ""
+        "${WHITE}${host}${NC}  ${DIM}${IP}${NC}"
+        "${CYAN}Proxmox Backup Server${NC}  ${DIM}${ver%%-*}${NC}"
+        "${DIM}iSCSI storage on Synology${NC}"
+        "$pill"
+        "${DIM}pbs-motd v${PBS_MOTD_VERSION:-?} · by MorphyDK${NC}"
+    )
+    echo
+    if [ "$COLS" -ge 76 ]; then
+        for (( i = 0; i < 6; i++ )); do
+            printf '   %s%s%s   %s\n' "${GRAD[i]}" "${art[i]}" "$NC" "${side[i]}"
+        done
+    else
+        for (( i = 1; i < 6; i++ )); do
+            printf '  %s\n' "${side[i]}"
+        done
+    fi
+    printf '  %s%s%s\n' "$CYAN" "$(printf '━%.0s' $(seq 1 $(( COLS > 66 ? 64 : COLS - 4 ))))" "$NC"
+}
+
+render_dashboard() {
+    local tmp pill scripts s
+    IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+    PROBLEMS=0; WARNINGS=0
+    tmp=$(mktemp) || return 1
+    gather_sessions
+    {
+        echo
+        panel_server
+        shopt -s nullglob
+        scripts=(/usr/local/bin/check-iscsi-session-*.sh)
+        shopt -u nullglob
+        if [ "${#scripts[@]}" -eq 0 ]; then
+            echo
+            panel_top "iSCSI storage" "$YELLOW"
+            panel_line "${YELLOW}No iSCSI installation found.${NC} Run pbs-post-install.sh to set one up."
+            panel_bottom
+        else
+            for s in "${scripts[@]}"; do panel_iscsi "$s"; done
+        fi
+        panel_datastore
+    } > "$tmp"
+    if [ "$PROBLEMS" -gt 0 ]; then
+        pill="${RED}✘ ${PROBLEMS} PROBLEM(S) - needs attention${NC}"
+    elif [ "$WARNINGS" -gt 0 ]; then
+        pill="${YELLOW}⚠ working, ${WARNINGS} warning(s)${NC}"
+    else
+        pill="${GREEN}● ALL SYSTEMS HEALTHY${NC}"
+    fi
+    banner "$pill"
+    cat "$tmp"
+    rm -f "$tmp"
+}
+
+# ---------------------------------------------------------------- help
+render_help() {
+    local mnt
+    mnt=$(sed -n 's/^MOUNT_PATH=//p' /usr/local/bin/check-iscsi-session-*.sh 2>/dev/null | head -n 1 | tr -d "'\"\\\\")
+    mnt="${mnt:-/mnt/pbs}"
+    echo
+    echo "  ${WHITE}Key commands${NC}  ${DIM}copy, paste, press Enter${NC}"
+    echo
+    panel_top "This login screen"
+    kv "Menu" "pbs-menu"
+    kv "Dashboard" "pbs-motd"
+    kv "Live view" "pbs-motd --watch   ${DIM}(refreshes every 3 seconds, q quits)${NC}"
+    kv "This page" "pbs-help"
+    panel_bottom
+    echo
+    panel_top "Connection to the Synology"
+    kv "Session" "iscsiadm -m session -P 1"
+    kv "Health check" "pbs-post-install.sh --status"
+    kv "CHAP login" "pbs-post-install.sh --fix-login"
+    kv "Monitor log" "tail -f /var/log/iscsi-monitor.log"
+    kv "Kernel log" "journalctl -u iscsid -n 50"
+    panel_bottom
+    echo
+    panel_top "Storage"
+    kv "Space" "df -h ${mnt}"
+    kv "Mount" "findmnt ${mnt}"
+    kv "Disks" "lsblk -f"
+    kv "TRIM" "fstrim -v ${mnt}"
+    panel_bottom
+    echo
+    panel_top "Proxmox Backup Server"
+    kv "Datastores" "proxmox-backup-manager datastore list"
+    kv "Tasks" "proxmox-backup-manager task list"
+    kv "Services" "systemctl status proxmox-backup-proxy"
+    kv "Logs" "journalctl -u proxmox-backup-proxy -n 50"
+    kv "Versions" "proxmox-backup-manager versions"
+    kv "Update" "apt update && apt full-upgrade"
+    panel_bottom
+    echo
+    echo "  ${DIM}Web UI: https://$(hostname -I 2>/dev/null | awk '{print $1}'):8007${NC}"
+    echo
+}
+
+# ---------------------------------------------------------------- input
+KEY=""
+read_key() {
+    local k="" rest=""
+    IFS= read -rsn1 k || true
+    if [ "$k" = $'\e' ]; then
+        IFS= read -rsn2 -t 0.05 rest || true
+        k+="$rest"
+    fi
+    case "$k" in
+        $'\e[A'|$'\eOA'|k|K) KEY="up" ;;
+        $'\e[B'|$'\eOB'|j|J) KEY="down" ;;
+        "")                  KEY="enter" ;;
+        q|Q|$'\e')           KEY="quit" ;;
+        [0-9])               KEY="num$k" ;;
+        *)                   KEY="other" ;;
+    esac
+}
+
+press_key() {
+    printf '\n  %sPress any key to go back…%s' "$DIM" "$NC"
+    IFS= read -rsn1 _ || true
+}
+
+ask_yn() {   # ask_yn "Question"  -> 0 = yes (default no)
+    local k
+    printf '\n  %s %s[y/N]%s ' "$1" "$DIM" "$NC"
+    IFS= read -rsn1 k || true
+    echo
+    [ "$k" = "y" ] || [ "$k" = "Y" ]
+}
+
+# menu_select VAR default "Label|hint" ...  ->  index, or -1 when q / Esc
+menu_select() {
+    local __var="$1" sel="$2" item n i first=1 d
+    shift 2
+    local -a labels=() hints=()
+    for item in "$@"; do
+        labels+=("${item%%|*}")
+        case "$item" in *"|"*) hints+=("${item#*|}") ;; *) hints+=("") ;; esac
+    done
+    n=${#labels[@]}
+    echo
+    printf '  %s↑/↓ choose · Enter select · 1-9 jump · q back%s\n' "$DIM" "$NC"
+    printf '\e[?25l'
+    while true; do
+        [ "$first" -eq 0 ] && printf '\e[%dA' $(( n + 1 ))
+        first=0
+        for (( i = 0; i < n; i++ )); do
+            if [ "$i" -eq "$sel" ]; then
+                printf '\r\e[K  %s❯ %d%s  %s%s%s\n' "$CYAN" $(( i + 1 )) "$NC" "$WHITE" "${labels[i]}" "$NC"
+            else
+                printf '\r\e[K    %s%d%s  %s\n' "$DIM" $(( i + 1 )) "$NC" "${labels[i]}"
+            fi
+        done
+        printf '\r\e[K       %s%s%s\n' "$DIM" "$(trunc "${hints[sel]}" $(( COLS - 9 )))" "$NC"
+        read_key
+        case "$KEY" in
+            up)    sel=$(( (sel - 1 + n) % n )) ;;
+            down)  sel=$(( (sel + 1) % n )) ;;
+            enter) break ;;
+            quit)  sel=-1; break ;;
+            num*)  d=${KEY#num}
+                   if [ "$d" -ge 1 ] && [ "$d" -le "$n" ]; then sel=$(( d - 1 )); fi ;;
+        esac
+    done
+    printf '\e[?25h'
+    printf -v "$__var" '%s' "$sel"
+}
+
+# ---------------------------------------------------------------- screens
+need_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "  ${YELLOW}This needs root - run:  sudo $0 $*${NC}" >&2
+        return 1
+    fi
+}
+
+mon_scripts() {
+    local f
+    for f in /usr/local/bin/check-iscsi-session-*.sh; do
+        [ -f "$f" ] && echo "$f"
+    done
+}
+
+screen_watch() {
+    local out k
+    printf '\e[?25l\e[2J'
+    trap 'printf "\e[?25h"; exit 0' INT TERM
+    while true; do
+        out=$(render_dashboard 2>&1)
+        printf '\e[H%s\n' "$(sed 's/$/\x1b[K/' <<< "$out")"
+        printf '\n  %sLive view · refreshes every 3 seconds · %s · q to quit%s\e[K\n\e[J' "$DIM" "$(date '+%H:%M:%S')" "$NC"
+        k=""
+        IFS= read -rsn1 -t 3 k
+        case "$k" in q|Q|$'\e') break ;; esac
+    done
+    printf '\e[?25h\n'
+    trap - INT TERM
+}
+
+screen_lun() {
+    local s TARGET PORTAL MOUNT_PATH iqn rt st auth user sid line
+    iqn=$(awk -F= '/^InitiatorName=/ {print $2}' /etc/iscsi/initiatorname.iscsi 2>/dev/null)
+    gather_sessions
+    while read -r -u 3 s; do
+        [ -z "$s" ] && continue
+        TARGET=""; PORTAL=""; MOUNT_PATH=""
+        # shellcheck disable=SC1090
+        source <(grep -E '^(TARGET|PORTAL|MOUNT_PATH)=' "$s")
+        echo
+        panel_top "LUN & connection · ${MOUNT_PATH}"
+        kv "Target" "${TARGET}"
+        kv "Synology" "${PORTAL}"
+        kv "This server" "${iqn:-unknown}"
+        rt=$(iscsiadm -m node -T "$TARGET" -p "$PORTAL" 2>/dev/null | awk -F' = ' '$1=="node.session.timeo.replacement_timeout"{print $2}')
+        st=$(iscsiadm -m node -T "$TARGET" -p "$PORTAL" 2>/dev/null | awk -F' = ' '$1=="node.startup"{print $2}')
+        auth=$(iscsiadm -m node -T "$TARGET" -p "$PORTAL" 2>/dev/null | awk -F' = ' '$1=="node.session.auth.authmethod"{print $2}')
+        user=$(iscsiadm -m node -T "$TARGET" -p "$PORTAL" 2>/dev/null | awk -F' = ' '$1=="node.session.auth.username"{print $2}')
+        kv "Login" "${auth:-none}${user:+ · user ${user}} ${DIM}(password hidden)${NC}"
+        kv "Starts at boot" "${st:-?}"
+        kv "Reconnect wait" "${rt:-?} s"
+        sid=$(awk -v t="$TARGET" '$4 == t { gsub(/\[|\]/, "", $2); print $2; exit }' <<< "$SESS1")
+        if [ -n "$sid" ]; then kv "Session" "id ${sid}"; else kv "Session" "${RED}none${NC}"; fi
+        panel_bottom
+        echo
+        panel_top "Session details (iscsiadm)"
+        timeout 10 iscsiadm -m session -P 1 2>/dev/null | awk -v t="$TARGET" '
+            /^Target:/ { in_t = ($2 == t) }
+            in_t && NF { print }' | while IFS= read -r line; do panel_line "${DIM}${line}${NC}"; done
+        panel_bottom
+    done 3< <(mon_scripts)
+    echo
+    panel_top "Disks"
+    lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,TRAN 2>/dev/null | while IFS= read -r line; do panel_line "$line"; done
+    panel_bottom
+}
+
+screen_storage() {
+    local s MOUNT_PATH line
+    echo
+    panel_top "Space"
+    while read -r -u 3 s; do
+        [ -z "$s" ] && continue
+        MOUNT_PATH=""
+        # shellcheck disable=SC1090
+        source <(grep -E '^MOUNT_PATH=' "$s")
+        timeout 5 df -hT "$MOUNT_PATH" 2>/dev/null | while IFS= read -r line; do panel_line "$line"; done
+    done 3< <(mon_scripts)
+    panel_bottom
+    echo
+    panel_top "Datastores (proxmox-backup-manager)"
+    timeout 15 proxmox-backup-manager datastore list 2>/dev/null | while IFS= read -r line; do panel_line "$line"; done
+    panel_bottom
+    echo
+    panel_top "Open tasks"
+    timeout 15 proxmox-backup-manager task list 2>/dev/null | head -n 12 | while IFS= read -r line; do panel_line "$(trunc "$line" $(( COLS - 6 )))"; done
+    panel_bottom
+}
+
+screen_health() {
+    if [ -x "$INSTALLER" ]; then
+        "$INSTALLER" --status
+    else
+        echo "  ${YELLOW}The installer copy (${INSTALLER}) was not found, so the full health check is not available.${NC}"
+        echo "  ${DIM}Run the installer again, or use the dashboard.${NC}"
+    fi
+}
+
+screen_repair() {
+    local s STATE_FILE
+    echo
+    panel_top "Check & repair now"
+    panel_line "Runs the monitor once, right now. If the connection or mount is broken it"
+    panel_line "repairs it: unmount › logout › login › mount › restart PBS."
+    panel_line "${DIM}A healthy system is left alone. Nothing is formatted or erased.${NC}"
+    panel_bottom
+    ask_yn "Run the monitor now?" || return 0
+    echo
+    while read -r -u 3 s; do
+        [ -z "$s" ] && continue
+        STATE_FILE=""
+        # shellcheck disable=SC1090
+        source <(grep -E '^STATE_FILE=' "$s")
+        rm -f "${STATE_FILE}.repair" "${STATE_FILE}.authfail"
+        echo "  ${CYAN}►${NC} $(basename "$s")"
+        timeout 400 "$s" </dev/null
+    done 3< <(mon_scripts)
+    echo
+    echo "  ${GREEN}Done.${NC} ${DIM}Last lines of the monitor log:${NC}"
+    screen_log 8
+}
+
+screen_log() {
+    local n="${1:-30}" line
+    [ -r "$MON_LOG" ] || { echo "  ${DIM}No monitor log yet - nothing has gone wrong.${NC}"; return 0; }
+    echo
+    panel_top "Monitor log · last ${n} lines"
+    tail -n "$n" "$MON_LOG" | while IFS= read -r line; do
+        case "$line" in
+            *REJECTED*|*Failed*|*failed*|*read-only*|*"no answer"*) panel_line "${RED}$(trunc "$line" $(( COLS - 6 )))${NC}" ;;
+            *Success*|*succeeded*|*healthy*)                      panel_line "${GREEN}$(trunc "$line" $(( COLS - 6 )))${NC}" ;;
+            *)                                                    panel_line "${DIM}$(trunc "$line" $(( COLS - 6 )))${NC}" ;;
+        esac
+    done
+    panel_bottom
+}
+
+screen_services() {
+    local u st c
+    while true; do
+        printf '\e[2J\e[H'
+        echo
+        panel_top "Services"
+        for u in proxmox-backup proxmox-backup-proxy iscsid cron fstrim.timer; do
+            st=$(timeout 5 systemctl is-active "$u" 2>/dev/null)
+            case "$st" in active) c="$GREEN" ;; *) c="$RED" ;; esac
+            kv "$u" "${c}${st:-unknown}${NC}"
+        done
+        panel_bottom
+        menu_select c 0 \
+            "Restart the PBS services|Restarts proxmox-backup and proxmox-backup-proxy - running backups are interrupted" \
+            "Back"
+        case "$c" in
+            0)
+                if ask_yn "Restart the PBS services now? Running backups will stop."; then
+                    timeout 90 systemctl restart proxmox-backup proxmox-backup-proxy \
+                        && echo "  ${GREEN}✔ Restarted${NC}" || echo "  ${RED}✘ Restart failed - see journalctl -u proxmox-backup-proxy${NC}"
+                    sleep 2
+                fi
+                ;;
+            *) return 0 ;;
+        esac
+    done
+}
+
+screen_settings() {
+    local c cur=1
+    case "$MODE" in off) cur=2 ;; dashboard) cur=0 ;; esac
+    echo
+    panel_top "Login screen"
+    kv "Now" "${MODE}"
+    panel_blank
+    panel_line "${DIM}Applies from the next login.${NC}"
+    panel_bottom
+    menu_select c "$cur" \
+        "Dashboard only|Shows the dashboard at login, then your shell" \
+        "Dashboard + menu prompt|After the dashboard: press m for the menu, h for help (${PROMPT_SECS}s, then the shell)" \
+        "Off|No login screen - pbs-menu still works"
+    case "$c" in
+        0) MODE=dashboard ;;
+        1) MODE=prompt ;;
+        2) MODE=off ;;
+        *) return 0 ;;
+    esac
+    need_root || return 0
+    printf 'MODE=%s\nPROMPT_SECS=%s\n' "$MODE" "$PROMPT_SECS" > "$CONF"
+    chmod 644 "$CONF"
+    echo "  ${GREEN}✔ Saved: ${MODE}${NC}"
+}
+
+menu_main() {
+    local c=0 rc
+    need_root || exit 1
+    while true; do
+        printf '\e[2J\e[H'
+        render_dashboard_compact
+        menu_select c "$c" \
+            "Live view|The dashboard, refreshing every 3 seconds" \
+            "LUN & connection|Target, login, session details, disks" \
+            "Storage & datastore|Free space, datastores, open tasks" \
+            "Health check|Full check including a test write (pbs-post-install.sh --status)" \
+            "Check & repair now|Runs the monitor once - repairs a lost connection" \
+            "Monitor log|The last events from the iSCSI monitor" \
+            "Services|Status of PBS, iSCSI and cron - restart PBS" \
+            "Help · key commands|The commands you will need" \
+            "Settings|Choose what happens at login" \
+            "Back to the shell"
+        [ "$c" -lt 0 ] && break
+        printf '\e[2J\e[H'
+        case "$c" in
+            0) screen_watch; continue ;;
+            1) screen_lun
+               if [ -x "$INSTALLER" ] && ask_yn "Type the CHAP login again (fix a rejected login)?"; then
+                   "$INSTALLER" --fix-login
+               fi ;;
+            2) screen_storage ;;
+            3) screen_health ;;
+            4) screen_repair ;;
+            5) screen_log 40 ;;
+            6) screen_services; continue ;;
+            7) render_help ;;
+            8) screen_settings ;;
+            *) break ;;
+        esac
+        press_key
+    done
+    printf '\e[2J\e[H'
+}
+
+# A short header for the menu: logo-less, with the status pill
+render_dashboard_compact() {
+    local pill
+    IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+    PROBLEMS=0; WARNINGS=0
+    gather_sessions
+    local s MOUNT_PATH TARGET src avail
+    echo
+    echo "  ${WHITE}PBS menu${NC}  ${DIM}$(hostname -s) · ${IP} · v${PBS_MOTD_VERSION:-?}${NC}"
+    printf '  %s%s%s\n' "$CYAN" "$(printf '━%.0s' $(seq 1 $(( COLS > 66 ? 64 : COLS - 4 ))))" "$NC"
+    while read -r -u 3 s; do
+        [ -z "$s" ] && continue
+        MOUNT_PATH=""; TARGET=""
+        # shellcheck disable=SC1090
+        source <(grep -E '^(TARGET|MOUNT_PATH)=' "$s")
+        src=$(findmnt -rn -M "$MOUNT_PATH" -o SOURCE 2>/dev/null)
+        avail=$(timeout 3 df -B1 --output=avail "$MOUNT_PATH" 2>/dev/null | tail -n 1 | tr -d ' ')
+        if [ -n "$src" ] && grep -qF "$TARGET" <<< "$SESS1"; then
+            echo "  ${GREEN}●${NC} ${MOUNT_PATH}  ${DIM}connected · $(hb "${avail:-0}") free${NC}"
+        else
+            echo "  ${RED}●${NC} ${MOUNT_PATH}  ${RED}not connected or not mounted${NC}"
+        fi
+    done 3< <(mon_scripts)
+}
+
+# ---------------------------------------------------------------- login
+# Right after a boot the iSCSI link is not up yet. Wait for it (max 25 s) instead of
+# showing red lines. After 6 s the monitor is started once, the same thing cron does every
+# minute (it never runs twice at once and only repairs what is broken).
+wait_for_storage() {
+    local s i=0 ready kicked=0 sp='|/-\' TARGET MOUNT_PATH sess shown=0
+    [ "$(uptime_secs)" -ge 600 ] && return 0
+    [ "$(id -u)" -eq 0 ] || return 0
+    while [ "$i" -lt 25 ]; do
+        ready=1
+        sess=$(timeout 5 iscsiadm -m session 2>/dev/null)
+        while read -r -u 3 s; do
+            [ -z "$s" ] && continue
+            TARGET=""; MOUNT_PATH=""
+            # shellcheck disable=SC1090
+            source <(grep -E '^(TARGET|MOUNT_PATH)=' "$s")
+            if ! grep -qF "$TARGET" <<< "$sess" || ! findmnt -rn -M "$MOUNT_PATH" >/dev/null 2>&1; then
+                ready=0
+            fi
+        done 3< <(mon_scripts)
+        [ "$ready" -eq 1 ] && break
+        shown=1
+        printf '\r  %s%s Waiting for the Synology connection - the server just started…%s\e[K' "$CYAN" "${sp:$(( i % 4 )):1}" "$NC"
+        if [ "$i" -eq 6 ] && [ "$kicked" -eq 0 ]; then
+            kicked=1
+            while read -r -u 3 s; do
+                [ -z "$s" ] && continue
+                ( timeout 90 "$s" </dev/null >/dev/null 2>&1 & )
+            done 3< <(mon_scripts)
+        fi
+        sleep 1
+        i=$(( i + 1 ))
+    done
+    [ "$shown" -eq 1 ] && printf '\r\e[K'
+    return 0
+}
+
+do_login() {
+    local k
+    [ "$MODE" = "off" ] && return 0
+    wait_for_storage
+    render_dashboard
+    panel_keys
+    echo
+    if [ "$MODE" = "prompt" ]; then
+        printf '  %sPress%s %sm%s %sfor the menu ·%s %sh%s %sfor help · or wait %ss%s ' \
+            "$DIM" "$NC" "$CYAN" "$NC" "$DIM" "$NC" "$CYAN" "$NC" "$DIM" "$PROMPT_SECS" "$NC"
+        k=""
+        IFS= read -rsn1 -t "$PROMPT_SECS" k
+        printf '\r\e[K'
+        case "$k" in
+            m|M) [ "$(id -u)" -eq 0 ] && menu_main ;;
+            h|H) render_help ;;
+        esac
+    fi
+}
+
+refresh_updates() {
+    local n
+    mkdir -p "$(dirname "$UPD_FILE")"
+    n=$(apt-get -s dist-upgrade 2>/dev/null | grep -c '^Inst ' || true)
+    echo "${n:-0}|$(date +%s)" > "$UPD_FILE"
+}
+
+case "$(basename "$0")" in
+    pbs-menu) set -- --menu ;;
+    pbs-help) set -- --help ;;
+esac
+
+case "${1:-}" in
+    "")        render_dashboard; panel_keys; echo ;;
+    --login)   do_login ;;
+    --watch)   screen_watch ;;
+    --menu)    menu_main ;;
+    --help|-h) render_help ;;
+    --refresh-updates) refresh_updates ;;
+    --version) echo "pbs-motd v${PBS_MOTD_VERSION:-?}" ;;
+    *)         echo "Usage: pbs-motd [--login|--watch|--menu|--help]" >&2; exit 2 ;;
+esac
+exit 0
+MOTD_EOF
+    } > "$dest"
+}
+
+# Copies this installer to /usr/local/sbin (so --status / --fix-login work from anywhere)
+install_self_copy() {
+    if [[ -f "$0" ]]; then
+        if [[ "$0" -ef /usr/local/sbin/pbs-post-install.sh ]] || cp "$0" /usr/local/sbin/pbs-post-install.sh 2>/dev/null; then
+            chmod 755 /usr/local/sbin/pbs-post-install.sh
+            return 0
+        fi
+    fi
+    [[ -x /usr/local/sbin/pbs-post-install.sh ]]
+}
+
+install_motd_files() {
+    mkdir -p /var/lib/pbs-motd
+    write_motd_script /usr/local/sbin/pbs-motd
+    chmod 755 /usr/local/sbin/pbs-motd
+    ln -sf /usr/local/sbin/pbs-motd /usr/local/bin/pbs-menu
+    ln -sf /usr/local/sbin/pbs-motd /usr/local/bin/pbs-help
+    ln -sf /usr/local/sbin/pbs-motd /usr/local/bin/pbs-motd
+    printf 'MODE=%s\nPROMPT_SECS=5\n' "$MOTD_MODE" > /etc/pbs-motd.conf
+    chmod 644 /etc/pbs-motd.conf
+    cat > /etc/profile.d/pbs-motd.sh <<'PROFILE_EOF'
+# Login dashboard for Proxmox Backup Server (written by pbs-post-install).
+# Remove with:  pbs-post-install.sh --motd-remove     Turn off: MODE=off in /etc/pbs-motd.conf
+case "$-" in *i*) ;; *) return 0 2>/dev/null ;; esac
+[ -t 0 ] && [ -t 1 ] || return 0
+[ "$(id -u)" = "0" ] || return 0
+[ -n "${PBS_MOTD_SHOWN:-}" ] && return 0
+[ -x /usr/local/sbin/pbs-motd ] || return 0
+export PBS_MOTD_SHOWN=1
+/usr/local/sbin/pbs-motd --login
+PROFILE_EOF
+    chmod 644 /etc/profile.d/pbs-motd.sh
+    # The static banner would show up twice - keep a copy of it
+    if [[ -s /etc/motd ]]; then
+        [[ -f /etc/motd.pbs-orig ]] || cp /etc/motd /etc/motd.pbs-orig
+        : > /etc/motd
+    fi
+    # Daily count of pending updates (read by the dashboard; no network needed)
+    cat > /etc/cron.d/pbs-motd <<'CRON_EOF'
+# Written by pbs-post-install: refresh the "updates available" count for the login screen
+17 6 * * * root /usr/local/sbin/pbs-motd --refresh-updates >/dev/null 2>&1
+CRON_EOF
+    chmod 644 /etc/cron.d/pbs-motd
+    /usr/local/sbin/pbs-motd --refresh-updates >/dev/null 2>&1 || true
+}
+
+step_motd() {
+    if [[ $DO_MOTD -ne 1 ]]; then
+        skip_step $S_MOTD "not requested"
+        return 0
+    fi
+    begin_step $S_MOTD
+    install_motd_files
+    ok "Login dashboard installed: ${WHITE}/usr/local/sbin/pbs-motd${NC}"
+    ok "Commands: ${WHITE}pbs-motd${NC} (dashboard) · ${WHITE}pbs-menu${NC} (menu) · ${WHITE}pbs-help${NC} (key commands)"
+    if install_self_copy; then
+        SELF_CMD="pbs-post-install.sh --status"
+    fi
+    finish_step $S_MOTD "$( [[ "$MOTD_MODE" == "prompt" ]] && echo 'dashboard + menu prompt' || echo 'dashboard' ) at login"
+}
+
+# --motd : install or update only the login screen
+run_motd_only() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "--motd needs root. Run:  sudo $0 --motd" >&2
+        return 2
+    fi
+    touch "$LOG_FILE"; chmod 600 "$LOG_FILE"
+    INSTALL_STARTED=1
+    if [[ -t 0 && -t 1 ]]; then
+        printf '\033[2J\033[H'
+        render_banner
+        DO_MOTD=1
+        setup_motd
+    fi
+    install_motd_files
+    install_self_copy || true
+    echo
+    ok "Login screen installed - it shows at the next login."
+    echo "  ${DIM}Preview now: pbs-motd · menu: pbs-menu · help: pbs-help${NC}"
+    echo
+}
+
+run_motd_remove() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "--motd-remove needs root. Run:  sudo $0 --motd-remove" >&2
+        return 2
+    fi
+    rm -f /etc/profile.d/pbs-motd.sh /etc/cron.d/pbs-motd /etc/pbs-motd.conf \
+          /usr/local/bin/pbs-menu /usr/local/bin/pbs-help /usr/local/bin/pbs-motd /usr/local/sbin/pbs-motd
+    rm -rf /var/lib/pbs-motd
+    if [[ -f /etc/motd.pbs-orig ]]; then
+        mv /etc/motd.pbs-orig /etc/motd
+    fi
+    echo "  ${GREEN}✔${NC} Login screen removed (the original /etc/motd is back)."
 }
 
 step_datastore() {
@@ -1916,26 +3684,22 @@ step_nag() {
         return 0
     fi
     begin_step $S_NAG
-    cat > /usr/local/bin/pbs-remove-nag.sh <<'NAG_EOF'
-#!/bin/bash
-# Removes the "No valid subscription" popup from the PBS web UI
-# (installed by pbs-post-install.sh, re-run by /etc/apt/apt.conf.d/99-pbs-no-nag)
-# Undo: rm /etc/apt/apt.conf.d/99-pbs-no-nag && apt reinstall proxmox-widget-toolkit
-JS=/usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js
-[ -f "$JS" ] || exit 0
-grep -q 'NO-NAG' "$JS" && exit 0
-sed -i -E 's/(checked_command: function\(orig_cmd\) \{)/\1 orig_cmd(); return; \/\/ NO-NAG/' "$JS"
-if grep -q 'NO-NAG' "$JS"; then
-    echo "Subscription popup removed"
-else
-    echo "Subscription popup: pattern not found - the UI code may have changed"
-fi
-NAG_EOF
-    chmod +x /usr/local/bin/pbs-remove-nag.sh
-    echo 'DPkg::Post-Invoke { "/usr/local/bin/pbs-remove-nag.sh || true"; };' > /etc/apt/apt.conf.d/99-pbs-no-nag
-    ok "Patch script and apt hook installed (re-applied after every update)"
-    run_quiet_soft "Patching the web interface" /usr/local/bin/pbs-remove-nag.sh
+    # The "NO NAG" method of the community-scripts post-pbs-install script (MIT):
+    # an apt hook patches proxmoxlib.js after every package change.
+    # Older versions of this installer used a different patch - remove it first
+    rm -f /usr/local/bin/pbs-remove-nag.sh /etc/apt/apt.conf.d/99-pbs-no-nag
     if grep -q 'NO-NAG' "$js" 2>/dev/null; then
+        run_quiet_soft "Restoring the original web interface file" \
+            "${APT_ENV[@]}" apt-get "${APT_OPTS[@]}" --reinstall install proxmox-widget-toolkit
+    fi
+    cat > /etc/apt/apt.conf.d/no-nag-script <<'NAG_EOF'
+DPkg::Post-Invoke { "if [ -s /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js ] && ! grep -q -F 'NoMoreNagging' /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js; then sed -i '/data\.status/{s/\!//;s/active/NoMoreNagging/}' /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js; fi" };
+NAG_EOF
+    ok "Apt hook installed: ${DIM}/etc/apt/apt.conf.d/no-nag-script (re-applied after every update)${NC}"
+    # Reinstalling the package runs the hook right away
+    run_quiet_soft "Applying the patch (reinstalling proxmox-widget-toolkit)" \
+        "${APT_ENV[@]}" apt-get "${APT_OPTS[@]}" --reinstall install proxmox-widget-toolkit
+    if grep -q 'NoMoreNagging' "$js" 2>/dev/null; then
         run_quiet_soft "Restarting the web interface" systemctl restart proxmox-backup-proxy
         note "Subscription popup removed - reload the web UI with Ctrl+Shift+R (Cmd+Shift+R on Mac)"
         finish_step $S_NAG "removed · kept after updates"
@@ -1970,6 +3734,7 @@ step_finish() {
         kv "Mount path" "$MOUNT_PATH"
         kv "fstab" "${DIM}${FSTAB_ENTRY}${NC}"
         kv "Monitor" "${CHECK_ISCSI_SCRIPT} ${DIM}(log: /var/log/iscsi-monitor.log)${NC}"
+        kv "Reconnect wait" "$(( REPLACEMENT_TIMEOUT / 60 )) minutes ${DIM}(open-iscsi default is 2)${NC}"
         if [[ "$DISK_ACTION" != "mounted" ]]; then
             panel_line "${DIM}The empty mount directory is immutable; to remove it later: chattr -i ${MOUNT_PATH}${NC}"
         fi
@@ -1996,6 +3761,12 @@ step_finish() {
             panel_line "   Fingerprint ${DIM}${fp}${NC}"
         fi
         panel_line "3. Check the prune and garbage-collection schedule on the datastore"
+    fi
+    if [[ $DO_ISCSI -eq 1 ]]; then
+        panel_line "Health check any time: ${WHITE}${SELF_CMD:-re-run the installer with --status}${NC}"
+    fi
+    if [[ $DO_MOTD -eq 1 ]]; then
+        panel_line "Login screen: ${WHITE}pbs-motd${NC} shows it now · ${WHITE}pbs-menu${NC} opens the menu · ${WHITE}pbs-help${NC} lists key commands"
     fi
     panel_bottom
     echo "  ${DIM}Install log: ${LOG_FILE}${NC}"
@@ -2039,13 +3810,501 @@ run_install() {
     fi
     step_datastore
     step_nag
+    step_motd
     step_finish
+}
+
+# ===========================================================================
+# STATUS DASHBOARD  (--status)  - read-only health check, changes nothing
+# ===========================================================================
+ST_PROBLEMS=0
+ST_WARNINGS=0
+
+st_info() { kv "$1" "$2"; }
+st_good() { kv "$1" "${GREEN}✔${NC} $2"; }
+st_warn() { kv "$1" "${YELLOW}⚠ $2${NC}"; ST_WARNINGS=$(( ST_WARNINGS + 1 )); }
+st_bad()  { kv "$1" "${RED}✘ $2${NC}"; ST_PROBLEMS=$(( ST_PROBLEMS + 1 )); }
+
+# usage_bar PERCENT  ->  coloured bar + percentage (yellow from 85%, red from 95%)
+usage_bar() {
+    local pct="$1" width=30 filled colour="$GREEN" full empty
+    if (( pct > 100 )); then pct=100; fi
+    filled=$(( pct * width / 100 ))
+    if (( pct >= 95 )); then
+        colour="$RED"
+    elif (( pct >= 85 )); then
+        colour="$YELLOW"
+    fi
+    full=$(printf '%*s' "$filled" '' | sed 's/ /█/g')
+    empty=$(printf '%*s' $(( width - filled )) '' | sed 's/ /░/g')
+    printf '%s%s%s%s%s %s%d%%%s' "$colour" "$full" "$NC" "$DIM" "$empty" "$colour" "$pct" "$NC"
+}
+
+# Creates, syncs and removes a small file. 0 = ok, 2 = failed, 3 = no answer in 10s
+status_write_test() {
+    local f="$1/.pbs-status-test" pid i
+    ( : > "$f" && sync -d "$f" && rm -f "$f" ) 2>/dev/null &
+    pid=$!
+    for i in $(seq 1 10); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            break
+        fi
+        sleep 1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        return 3
+    fi
+    if wait "$pid"; then
+        return 0
+    fi
+    return 2
+}
+
+# One installation = one monitor script in /usr/local/bin (it holds target, portal, mount path)
+status_one() {
+    local script="$1" TARGET="" PORTAL="" MOUNT_PATH=""
+    local service_name src fstype opts disk disc state sid rt live rt_show
+    local size used avail pct used_h size_h ds rc cutoff events last_line conf mode drop sess_up auth
+
+    # shellcheck disable=SC1090
+    source <(grep -E '^(TARGET|PORTAL|MOUNT_PATH)=' "$script" || true)
+    if [[ -z "$TARGET" || -z "$MOUNT_PATH" ]]; then
+        echo
+        panel_top "$(basename "$script")" "$YELLOW"
+        panel_line "${YELLOW}Could not read the target and mount path from this monitor script.${NC}"
+        panel_bottom
+        ST_WARNINGS=$(( ST_WARNINGS + 1 ))
+        return 0
+    fi
+    TARGET_IQN="$TARGET"
+    PORTAL_IP="$PORTAL"
+    service_name=$(basename "$MOUNT_PATH")
+    KNOWN_NODES+=("${TARGET}|$(norm_portal "$PORTAL")")
+
+    echo
+    panel_top "iSCSI · ${MOUNT_PATH}"
+    st_info "Target" "${TARGET##*:} ${DIM}(${PORTAL})${NC}"
+
+    # --- session ---
+    sess_up=0
+    if session_active; then
+        sess_up=1
+        state=$(timeout 20 iscsiadm -m session -P 3 2>/dev/null | awk -v t="$TARGET" '
+            /^[[:space:]]*Target:/ { in_t = ($2 == t) }
+            in_t && /iSCSI Session State:/ { print $NF; exit }
+        ' || true)
+        if [[ -z "$state" || "$state" == "LOGGED_IN" ]]; then
+            st_good "Session" "connected"
+        else
+            st_bad "Session" "${state} - the connection is down or recovering"
+        fi
+    else
+        if [[ -f "/run/iscsi-monitor-${service_name}.state.authfail" ]]; then
+            st_bad "Session" "not connected - the Synology REJECTED the login (CHAP)"
+        else
+            st_bad "Session" "not connected"
+        fi
+    fi
+
+    # --- stored login ---
+    auth=$(node_auth_state "$PORTAL" "$TARGET")
+    case "$auth" in
+        chap)
+            st_good "Stored login" "CHAP, user $(node_field "$PORTAL" "$TARGET" node.session.auth.username)"
+            ;;
+        none)
+            if [[ $sess_up -eq 1 ]]; then
+                st_info "Stored login" "${DIM}no authentication${NC}"
+            else
+                st_warn "Stored login" "no CHAP login stored - if the target uses CHAP, run: $(self_name) --fix-login"
+            fi
+            ;;
+        *)
+            if [[ $sess_up -eq 1 ]]; then
+                st_warn "Stored login" "CHAP login missing/incomplete - the NEXT reconnect will fail. Run: $(self_name) --fix-login"
+            else
+                st_bad "Stored login" "CHAP login missing/incomplete - the monitor cannot reconnect. Run: $(self_name) --fix-login"
+            fi
+            ;;
+    esac
+
+    # --- reconnect patience ---
+    rt=$(iscsiadm -m node -T "$TARGET" -p "$PORTAL" 2>/dev/null \
+        | awk -F' = ' '$1 == "node.session.timeo.replacement_timeout" { print $2 }' || true)
+    sid=$(iscsiadm -m session 2>/dev/null | awk -v t="$TARGET" '$4 == t { gsub(/\[|\]/, "", $2); print $2; exit }' || true)
+    live=""
+    if [[ -n "$sid" ]]; then
+        live=$(cat "/sys/class/iscsi_session/session${sid}/recovery_tmo" 2>/dev/null || true)
+    fi
+    rt_show="${live:-$rt}"
+    if [[ "$rt_show" =~ ^[0-9]+$ ]] && (( rt_show >= 300 )); then
+        st_good "Reconnect wait" "$(( rt_show / 60 )) minutes before I/O errors"
+    elif [[ "$rt_show" =~ ^[0-9]+$ ]]; then
+        st_warn "Reconnect wait" "only ${rt_show}s - a Synology restart can break the filesystem. Re-run the installer to raise it"
+    else
+        st_warn "Reconnect wait" "unknown"
+    fi
+
+    # --- mount ---
+    src=$(findmnt -rn -M "$MOUNT_PATH" -o SOURCE 2>/dev/null || true)
+    if [[ -z "$src" ]]; then
+        st_bad "Mount" "not mounted"
+    else
+        fstype=$(findmnt -rn -M "$MOUNT_PATH" -o FSTYPE 2>/dev/null || true)
+        opts=$(findmnt -rn -M "$MOUNT_PATH" -o OPTIONS 2>/dev/null || true)
+        if [[ ",${opts}," == *,ro,* ]]; then
+            st_bad "Mount" "READ-ONLY (${fstype}) - the filesystem hit an I/O error"
+        else
+            st_good "Mount" "${src} · ${fstype} · read-write"
+        fi
+
+        # --- space ---
+        read -r size used avail < <(timeout 15 df -B1 --output=size,used,avail "$MOUNT_PATH" 2>/dev/null | tail -n 1) || true
+        if [[ "${size:-}" =~ ^[0-9]+$ && "$size" -gt 0 ]]; then
+            pct=$(( used * 100 / size ))
+            used_h=$(numfmt --to=iec --suffix=B "$used" 2>/dev/null || echo "$used")
+            size_h=$(numfmt --to=iec --suffix=B "$size" 2>/dev/null || echo "$size")
+            kv "Space" "$(usage_bar "$pct")  ${DIM}${used_h} of ${size_h}${NC}"
+            if (( pct >= 95 )); then
+                ST_PROBLEMS=$(( ST_PROBLEMS + 1 ))
+                kv "" "${RED}✘ almost full - backups will fail${NC}"
+            elif (( pct >= 85 )); then
+                ST_WARNINGS=$(( ST_WARNINGS + 1 ))
+                kv "" "${YELLOW}⚠ getting full - check prune and garbage collection${NC}"
+            fi
+        else
+            st_warn "Space" "df did not answer in time"
+        fi
+
+        # --- write test ---
+        if [[ ",${opts}," != *,ro,* ]]; then
+            rc=0
+            status_write_test "$MOUNT_PATH" || rc=$?
+            case "$rc" in
+                0) st_good "Write test" "a test file was written and removed" ;;
+                3) st_bad "Write test" "no answer within 10 s - the storage is not responding" ;;
+                *) st_bad "Write test" "failed" ;;
+            esac
+        fi
+
+        # --- TRIM ---
+        disk=$(lsblk -no PKNAME "$src" 2>/dev/null | head -n 1 || true)
+        if [[ -z "$disk" ]]; then
+            disk=$(basename "$src")
+        fi
+        disc=$(cat "/sys/block/${disk}/queue/discard_max_bytes" 2>/dev/null || echo 0)
+        if [[ "$disc" =~ ^[0-9]+$ ]] && (( disc > 0 )); then
+            if systemctl is-active --quiet fstrim.timer 2>/dev/null; then
+                st_good "TRIM" "weekly - deleted backups give space back to the Synology"
+            else
+                st_warn "TRIM" "the LUN supports it, but fstrim.timer is not running"
+            fi
+        else
+            st_info "TRIM" "${DIM}not supported by this LUN (thick, or space reclamation is off)${NC}"
+        fi
+    fi
+
+    # --- datastore ---
+    ds=$(awk -v p="$MOUNT_PATH" '
+        /^datastore:/ { name = $2 }
+        $1 == "path" && ($2 == p || index($2, p "/") == 1) { print name }
+    ' "$DS_CFG" 2>/dev/null | paste -sd, - || true)
+    if [[ -n "$ds" ]]; then
+        if systemctl is-active --quiet proxmox-backup-proxy 2>/dev/null; then
+            st_good "Datastore" "${ds} ${DIM}(PBS is running)${NC}"
+        else
+            st_bad "Datastore" "${ds} - but the PBS service (proxmox-backup-proxy) is not running"
+        fi
+    else
+        st_info "Datastore" "${DIM}none on this LUN yet${NC}"
+    fi
+
+    # --- boot order ---
+    drop="/etc/systemd/system/proxmox-backup-proxy.service.d/10-iscsi-${service_name}.conf"
+    if [[ -f "$drop" ]]; then
+        st_good "Boot order" "PBS starts after the mount"
+    else
+        st_warn "Boot order" "not configured - re-run the installer (v1.6+) to add it"
+    fi
+
+    # --- monitor ---
+    if [[ -x "$script" ]] && crontab -l 2>/dev/null | grep -qF "$script"; then
+        st_good "Monitor" "runs every minute"
+    else
+        st_bad "Monitor" "the cron job is missing"
+    fi
+    cutoff=$(date -d '24 hours ago' '+%F %T')
+    events=0
+    last_line=""
+    if [[ -r /var/log/iscsi-monitor.log ]]; then
+        events=$(awk -v c="$cutoff" 'substr($0, 1, 19) >= c' /var/log/iscsi-monitor.log \
+            | grep -cE 'Failed|failed|Repairing|read-only|no answer|state is|REJECTED' || true)
+        last_line=$(tail -n 1 /var/log/iscsi-monitor.log 2>/dev/null || true)
+    fi
+    if [[ "${events:-0}" -gt 0 ]]; then
+        st_warn "Last 24 hours" "${events} problem event(s) in the monitor log"
+    else
+        st_good "Last 24 hours" "no problems logged"
+    fi
+    if [[ -n "$last_line" ]]; then
+        kv "Last log line" "${DIM}$(trunc "$last_line" $(( $(term_cols) - 22 )))${NC}"
+    fi
+
+    # --- alerts ---
+    conf="/etc/pbs-iscsi-monitor-${service_name}.conf"
+    mode=$(sed -n "s/^NOTIFY_MODE=//p" "$conf" 2>/dev/null | head -n 1 || true)
+    case "$mode" in
+        url)  st_good "Alerts" "push message / webhook" ;;
+        mail) st_good "Alerts" "email" ;;
+        *)    st_info "Alerts" "${DIM}off - the monitor only writes to its log${NC}" ;;
+    esac
+    panel_bottom
+}
+
+# "pbs-post-install.sh" if the installed copy exists, otherwise how this script was started
+self_name() {
+    if [[ -x /usr/local/sbin/pbs-post-install.sh ]]; then
+        echo "pbs-post-install.sh"
+    else
+        echo "$0"
+    fi
+}
+
+# Panel with iSCSI records that no installation uses
+status_stale_records() {
+    local -a stale=()
+    local rec portal iqn startup auth
+    mapfile -t stale < <(find_stale_records)
+    if [[ ${#stale[@]} -eq 0 ]]; then
+        return 0
+    fi
+    echo
+    panel_top "Other iSCSI records" "$YELLOW"
+    for rec in "${stale[@]}"; do
+        IFS='|' read -r portal iqn startup auth <<< "$rec"
+        if [[ "$startup" == "automatic" && "$auth" != "chap" ]]; then
+            st_warn "${iqn##*:}" "${portal} logs in at boot WITHOUT a valid CHAP login (failed logins in the Synology log)"
+        else
+            st_info "${iqn##*:}" "${DIM}${portal} · boot login: ${startup:-?} · CHAP: ${auth} · unused${NC}"
+        fi
+    done
+    panel_blank
+    panel_line "${DIM}Remove one:  iscsiadm -m node -T <target> -p <portal> -o delete${NC}"
+    panel_bottom
+}
+
+run_status() {
+    local -a scripts=()
+    local s pbs_ver host_ip
+    if [[ $EUID -ne 0 ]]; then
+        echo "--status needs root (it talks to iscsiadm). Run:  sudo $0 --status" >&2
+        return 2
+    fi
+    if [[ ! -t 1 ]]; then
+        # Plain text when piped or run from cron
+        RED=""; GREEN=""; YELLOW=""; BLUE=""; MAGENTA=""; CYAN=""; WHITE=""; DIM=""; BOLD=""; NC=""
+    fi
+    pbs_ver=$(proxmox-backup-manager versions 2>/dev/null | head -n 1 | awk '{print $2}' || true)
+    host_ip=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
+
+    echo
+    echo "  ${WHITE}PBS Post-Install${NC}  ${DIM}v${VERSION} · health check · $(date '+%F %H:%M')${NC}"
+    echo "${CYAN}${RULE}${NC}"
+    echo
+    panel_top "This server"
+    kv "Hostname" "$(hostname -f 2>/dev/null || hostname)  ${DIM}${host_ip}${NC}"
+    kv "PBS" "${pbs_ver:-${YELLOW}not detected${NC}}"
+    panel_bottom
+
+    shopt -s nullglob
+    scripts=(/usr/local/bin/check-iscsi-session-*.sh)
+    shopt -u nullglob
+    if [[ ${#scripts[@]} -eq 0 ]]; then
+        echo
+        panel_top "No installation found" "$YELLOW"
+        panel_line "No iSCSI monitor script exists on this server."
+        panel_line "Run the installer without options to set it up."
+        panel_bottom
+        return 2
+    fi
+    KNOWN_NODES=()
+    for s in "${scripts[@]}"; do
+        status_one "$s"
+    done
+    status_stale_records
+
+    echo
+    if [[ $ST_PROBLEMS -gt 0 ]]; then
+        echo "  ${RED}✘ ${ST_PROBLEMS} problem(s) found${NC}"
+        echo "  ${DIM}Monitor log: /var/log/iscsi-monitor.log${NC}"
+        echo
+        return 1
+    elif [[ $ST_WARNINGS -gt 0 ]]; then
+        echo "  ${YELLOW}⚠ Working, but ${ST_WARNINGS} warning(s) - see above${NC}"
+        echo
+        return 0
+    fi
+    echo "  ${GREEN}✔ Everything looks healthy${NC}"
+    echo
+    return 0
+}
+
+# --fix-login: type the CHAP username/password again for an installed target.
+# Use it when the Synology log shows "failed to login ... CHAP required but absent".
+run_fix_login() {
+    local -a scripts=() items=()
+    local s choice=0 TARGET="" PORTAL="" MOUNT_PATH=""
+    if [[ $EUID -ne 0 ]]; then
+        echo "--fix-login needs root. Run:  sudo $0 --fix-login" >&2
+        return 2
+    fi
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        echo "--fix-login is interactive - run it directly in a terminal." >&2
+        return 2
+    fi
+    INSTALL_STARTED=1      # nothing to undo if this is cancelled
+    touch "$LOG_FILE"
+    chmod 600 "$LOG_FILE"
+    INITIATOR_IQN=$(awk -F= '/^InitiatorName=/ {print $2}' /etc/iscsi/initiatorname.iscsi 2>/dev/null || true)
+
+    shopt -s nullglob
+    scripts=(/usr/local/bin/check-iscsi-session-*.sh)
+    shopt -u nullglob
+    if [[ ${#scripts[@]} -eq 0 ]]; then
+        echo "No iSCSI installation found on this server (no monitor script in /usr/local/bin)." >&2
+        return 2
+    fi
+    if [[ ${#scripts[@]} -gt 1 ]]; then
+        for s in "${scripts[@]}"; do
+            TARGET=""; PORTAL=""; MOUNT_PATH=""
+            # shellcheck disable=SC1090
+            source <(grep -E '^(TARGET|PORTAL|MOUNT_PATH)=' "$s" || true)
+            items+=("${MOUNT_PATH}|${TARGET}")
+        done
+        TARGET=""; PORTAL=""; MOUNT_PATH=""
+        echo
+        echo "  ${WHITE}Which installation should be fixed?${NC}"
+        menu_select choice 0 "${items[@]}"
+    fi
+    # shellcheck disable=SC1090
+    source <(grep -E '^(TARGET|PORTAL|MOUNT_PATH)=' "${scripts[choice]}" || true)
+    if [[ -z "$TARGET" || -z "$PORTAL" ]]; then
+        echo "Could not read the target and portal from ${scripts[choice]}." >&2
+        return 2
+    fi
+    TARGET_IQN="$TARGET"
+    PORTAL_IP="$PORTAL"
+
+    printf '\033[2J\033[H'
+    render_banner
+    echo
+    panel_top "Fix the iSCSI login"
+    kv "Target" "${TARGET}"
+    kv "Synology" "${PORTAL}"
+    kv "This server" "${INITIATOR_IQN:-unknown}"
+    panel_blank
+    panel_line "Type the CHAP username and password as set on the Synology:"
+    panel_line "${DIM}SAN Manager › iSCSI › Target › Edit › Authentication (password: 12-16 characters)${NC}"
+    panel_bottom
+
+    ensure_iscsi_service
+    create_node_record
+    while true; do
+        CHAP_MODE=1
+        CHAP_KEEP=0
+        echo
+        ask_required CHAP_USER "CHAP username"
+        ask_secret CHAP_PASS "CHAP password"
+        apply_auth
+        node_update node.startup automatic
+        node_update node.session.timeo.replacement_timeout "$REPLACEMENT_TIMEOUT"
+        ok "The CHAP login is saved"
+        log_msg "fix-login: CHAP login re-entered for ${TARGET}"
+
+        if session_active; then
+            ok "The connection is already up - the new login is used at the next reconnect"
+            rm -f /run/iscsi-monitor-*.state.authfail
+            return 0
+        fi
+        echo
+        run_quiet_soft "Logging in to ${TARGET_IQN##*:}" \
+            timeout 30 iscsiadm -m node -T "$TARGET_IQN" -p "$PORTAL_IP" --login
+        LOGIN_RC=$RUN_RC
+        if [[ $LOGIN_RC -eq 0 || $LOGIN_RC -eq 15 ]]; then
+            ok "Connected - the CHAP login works"
+            rm -f /run/iscsi-monitor-*.state.authfail
+            if [[ -n "$MOUNT_PATH" ]] && ! findmnt -rn -M "$MOUNT_PATH" >/dev/null 2>&1; then
+                sleep 3
+                run_quiet_soft "Mounting ${MOUNT_PATH}" timeout 60 mount "$MOUNT_PATH"
+                if [[ $RUN_RC -ne 0 ]]; then
+                    warn "Could not mount ${MOUNT_PATH} yet - the monitor retries every minute."
+                fi
+            fi
+            echo
+            echo "  ${DIM}Check everything with: $(self_name) --status${NC}"
+            return 0
+        fi
+        show_login_error
+        menu_select choice 0 "Enter the login again" "Quit|The login stays as typed; nothing else was changed"
+        if [[ $choice -ne 0 ]]; then
+            return 1
+        fi
+    done
+}
+
+usage() {
+    cat <<EOF
+PBS Post-Install v${VERSION}
+
+  ./pbs-post-install.sh              interactive installer (run as root, in a terminal)
+  ./pbs-post-install.sh --status     health dashboard - changes nothing
+                                     exit code 0 = healthy, 1 = problem found, 2 = not installed
+  ./pbs-post-install.sh --fix-login  type the CHAP username/password again for an installed
+                                     target (Synology log: "CHAP required but absent")
+  ./pbs-post-install.sh --motd       install / update only the login dashboard + menu
+  ./pbs-post-install.sh --motd-remove  remove the login screen (restores /etc/motd)
+  ./pbs-post-install.sh --version
+  ./pbs-post-install.sh --help
+EOF
 }
 
 # ===========================================================================
 # MAIN
 # ===========================================================================
 main() {
+    local rc=0
+    case "${1:-}" in
+        "") ;;
+        --status|-s)
+            run_status || rc=$?
+            exit "$rc"
+            ;;
+        --fix-login)
+            run_fix_login || rc=$?
+            exit "$rc"
+            ;;
+        --motd)
+            run_motd_only || rc=$?
+            exit "$rc"
+            ;;
+        --motd-remove)
+            run_motd_remove || rc=$?
+            exit "$rc"
+            ;;
+        --version|-V)
+            echo "pbs-post-install v${VERSION}"
+            exit 0
+            ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
     preflight
     run_setup
     run_install
