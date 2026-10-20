@@ -474,9 +474,9 @@ The datastore itself is removed in the PBS web UI (Datastore › Remove). That d
 
 ## Tested, and not yet tested
 
-**Developed and run against:** Proxmox Backup Server 4.2.x on Debian 13 (trixie), a Synology NAS over iSCSI with CHAP, a fresh LUN formatted as ext4, a thin-provisioned LUN with TRIM.
+**Developed and run against:** Proxmox Backup Server 4.2.x on Debian 13 (trixie), a Synology NAS over iSCSI with CHAP, one thin and one thick LUN (ext4), with TRIM and the login dashboard on two drives.
 
-**Not yet verified on real hardware:** what happens through a full DSM update/reboot with a backup running, the automatic repair after a long outage, XFS on very large LUNs, and the PBS task parsing on the login screen (last backup, GC, verify). **Please test restores before you rely on any backup setup**, and open an issue if something behaves differently on your system.
+**Not yet verified on real hardware:** what happens through a full DSM update/reboot with a backup running, the automatic repair after a long outage, and XFS on very large LUNs. **Please test restores before you rely on any backup setup**, and open an issue if something behaves differently on your system.
 
 The script has not been linted with `shellcheck` yet.
 
