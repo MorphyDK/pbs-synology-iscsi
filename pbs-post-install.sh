@@ -7,7 +7,7 @@
 # 
 # Thanks to Derek Seaman's Tech Blog who inspired me to make this.
 #
-# Version 1.7.6  20/10-2026
+# Version 1.7.7  20/10-2026
 # Author MorphyDK
 #
 # Usage:  ./pbs-post-install.sh              interactive installer
@@ -16,6 +16,12 @@
 #         ./pbs-post-install.sh --motd       install / update only the login screen
 #         ./pbs-post-install.sh --motd-remove  remove the login screen again
 #         ./pbs-post-install.sh --help
+#
+# Changes in 1.7.7:
+#  - Detects thin vs thick LUNs (the disk reports it) and says so: the installer, --status and
+#    the login screen show "LUN type". A thick LUN no longer claims "weekly TRIM gives space
+#    back" (nothing can be given back); a thin LUN with space reclamation switched off in DSM
+#    gets a warning with where to turn it on
 #
 # Changes in 1.7.6:
 #  - Formatting is much faster on big LUNs: no block-by-block discard while creating the
@@ -87,7 +93,7 @@
 set -eE
 export LC_ALL=C.UTF-8
 
-VERSION="1.7.6"
+VERSION="1.7.7"
 LOG_FILE="/var/log/pbs-post-install.log"
 FS_LABEL="pbs-data"
 FOUR_TIB=4398046511104
@@ -178,6 +184,7 @@ LUN_SERIAL=""
 LUN_NUM=""
 LUN_MODEL=""
 LUN_DISCARD=0
+LUN_PROV=""
 LUN_EMPTY=0
 LUN_LAYOUT=""
 PROBE_NODE=""
@@ -1155,6 +1162,32 @@ release_holders() {
 # ---------------------------------------------------------------------------
 # LUN inspection (read-only)
 # ---------------------------------------------------------------------------
+# Thin or thick? The disk reports it itself (SCSI "Logical Block Provisioning" page and the
+# kernel's discard mode). Prints one of:
+#   thin      thin LUN, space reclamation (UNMAP) works
+#   thin-off  thin LUN, but space reclamation is switched off on the NAS
+#   thick     thick LUN: space is reserved, nothing can be given back
+#   unknown   the disk does not say
+lun_provisioning() {
+    local d="$1" mode b5 b6 type=0
+    mode=$(cat /sys/block/"${d}"/device/scsi_disk/*/provisioning_mode 2>/dev/null | head -n 1 || true)
+    read -r b5 b6 < <(od -An -tu1 -j5 -N2 "/sys/block/${d}/device/vpd_pgb2" 2>/dev/null) || true
+    if [[ "${b6:-}" =~ ^[0-9]+$ ]]; then
+        type=$(( b6 & 7 ))        # 1 = resource provisioned (thick), 2 = thin provisioned
+    fi
+    if (( type == 1 )); then
+        echo thick
+    elif [[ "$mode" == "unmap" ]]; then
+        echo thin
+    elif (( type == 2 )); then
+        echo thin-off
+    elif [[ -n "$mode" ]]; then
+        echo thick
+    else
+        echo unknown
+    fi
+}
+
 probe_lun() {
     local dev="$DEVICE_PATH" base disc devfs pttype t p opts dir chunks ds_root
     local -a parts=() candidates=()
@@ -1170,11 +1203,17 @@ probe_lun() {
     LUN_SERIAL=$(lun_attr "$dev" SERIAL)
     LUN_NUM=$(lun_number "$dev")
     LUN_MODEL=$(lsblk -dno VENDOR,MODEL "$dev" 2>/dev/null | xargs || true)
-    disc=$(cat "/sys/block/${base}/queue/discard_max_bytes" 2>/dev/null || echo 0)
+    LUN_PROV=$(lun_provisioning "$base")
     LUN_DISCARD=0
-    if [[ "$disc" =~ ^[0-9]+$ ]] && (( disc > 0 )); then
-        LUN_DISCARD=1
-    fi
+    case "$LUN_PROV" in
+        thin) LUN_DISCARD=1 ;;
+        unknown)
+            disc=$(cat "/sys/block/${base}/queue/discard_max_bytes" 2>/dev/null || echo 0)
+            if [[ "$disc" =~ ^[0-9]+$ ]] && (( disc > 0 )); then
+                LUN_DISCARD=1
+            fi
+            ;;
+    esac
 
     pttype=$(blkid -p -s PTTYPE -o value "$dev" 2>/dev/null || true)
     devfs=$(blkid -p -s TYPE -o value "$dev" 2>/dev/null || true)
@@ -1251,11 +1290,21 @@ show_lun_report() {
     panel_top "LUN on ${TARGET_IQN##*:}"
     kv "Device" "${DEVICE_PATH}  ${DIM}${LUN_MODEL}${NC}"
     kv "Size" "${WHITE}${LUN_SIZE_H}${NC}"
-    if [[ $LUN_DISCARD -eq 1 ]]; then
-        kv "Reclamation" "${GREEN}TRIM supported${NC} ${DIM}(thin LUN with space reclamation)${NC}"
-    else
-        kv "Reclamation" "${YELLOW}no TRIM${NC} ${DIM}(thick LUN, or space reclamation is off)${NC}"
-    fi
+    case "$LUN_PROV" in
+        thin)
+            kv "LUN type" "${GREEN}thin${NC} ${DIM}· space reclamation is on - weekly TRIM gives space back${NC}" ;;
+        thin-off)
+            kv "LUN type" "${YELLOW}thin, space reclamation is OFF${NC}"
+            kv "" "${DIM}Deleted backups will not free space. DSM › SAN Manager › LUN › Edit${NC}" ;;
+        thick)
+            kv "LUN type" "${CYAN}thick${NC} ${DIM}· space is reserved on the NAS, TRIM is not needed${NC}" ;;
+        *)
+            if [[ $LUN_DISCARD -eq 1 ]]; then
+                kv "LUN type" "${DIM}not reported · accepts TRIM${NC}"
+            else
+                kv "LUN type" "${DIM}not reported · no TRIM${NC}"
+            fi ;;
+    esac
 
     if [[ $LUN_EMPTY -eq 1 ]]; then
         kv "Contents" "${GREEN}empty - ready to be prepared${NC}"
@@ -2079,7 +2128,7 @@ setup_review() {
         if [[ ${#LUN_DEVS[@]} -gt 1 ]]; then
             lun_txt=" · LUN ${LUN_NUM:-?} (1 of ${#LUN_DEVS[@]} on this target)"
         fi
-        kv "LUN" "${LUN_SIZE_H} · $( [[ $LUN_DISCARD -eq 1 ]] && echo 'TRIM supported' || echo 'no TRIM' )${lun_txt}"
+        kv "LUN" "${LUN_SIZE_H} · $( case "$LUN_PROV" in thin) echo 'thin · weekly TRIM' ;; thin-off) echo 'thin · reclamation off' ;; thick) echo 'thick · no TRIM needed' ;; *) [[ $LUN_DISCARD -eq 1 ]] && echo 'TRIM supported' || echo 'no TRIM' ;; esac )${lun_txt}"
         case "$DISK_ACTION" in
             new)     kv "Disk" "${GREEN}create GPT partition + ${FS_TYPE}${NC}" ;;
             format)  kv "Disk" "${RED}ERASE the LUN and format it as ${FS_TYPE}${NC}" ;;
@@ -2806,6 +2855,19 @@ st_down() {
     fi
 }
 
+# thin | thin-off | thick | unknown  (see pbs-post-install.sh, lun_provisioning)
+lun_provisioning() {
+    local d="$1" mode b5 b6 type=0
+    mode=$(cat /sys/block/"${d}"/device/scsi_disk/*/provisioning_mode 2>/dev/null | head -n 1)
+    read -r b5 b6 < <(od -An -tu1 -j5 -N2 "/sys/block/${d}/device/vpd_pgb2" 2>/dev/null)
+    case "${b6:-}" in ''|*[!0-9]*) ;; *) type=$(( b6 & 7 )) ;; esac
+    if [ "$type" -eq 1 ]; then echo thick
+    elif [ "$mode" = "unmap" ]; then echo thin
+    elif [ "$type" -eq 2 ]; then echo thin-off
+    elif [ -n "$mode" ]; then echo thick
+    else echo unknown; fi
+}
+
 # bar PERCENT [WIDTH]   yellow from 85 %, red from 95 %
 bar() {
     local pct="$1" width="${2:-24}" filled colour="$GREEN" full empty
@@ -2932,15 +2994,24 @@ panel_iscsi() {
         dd=$(basename "$(lsblk -no PKNAME "$src" 2>/dev/null | head -n 1)")
         [ -z "$dd" ] || [ "$dd" = "." ] && dd=$(basename "$src")
         disc=$(cat "/sys/block/${dd}/queue/discard_max_bytes" 2>/dev/null || echo 0)
-        if [ "${disc:-0}" -gt 0 ] 2>/dev/null; then
-            if timeout 5 systemctl is-active --quiet fstrim.timer 2>/dev/null; then
-                st_info "TRIM" "weekly - deleted backups give space back to the Synology"
-            else
-                st_warn "TRIM" "supported, but fstrim.timer is not running"
-            fi
-        else
-            st_info "TRIM" "${DIM}not supported by this LUN${NC}"
-        fi
+        case "$(lun_provisioning "$dd")" in
+            thin)
+                if timeout 5 systemctl is-active --quiet fstrim.timer 2>/dev/null; then
+                    st_info "LUN type" "thin ${DIM}· weekly TRIM gives deleted backups back to the Synology${NC}"
+                else
+                    st_warn "LUN type" "thin, but fstrim.timer is not running"
+                fi
+                ;;
+            thin-off) st_warn "LUN type" "thin, but space reclamation is OFF on the Synology" ;;
+            thick)    st_info "LUN type" "thick ${DIM}· space is reserved on the NAS, TRIM not needed${NC}" ;;
+            *)
+                if [ "${disc:-0}" -gt 0 ] 2>/dev/null; then
+                    st_info "LUN type" "${DIM}not reported · accepts TRIM${NC}"
+                else
+                    st_info "LUN type" "${DIM}not reported${NC}"
+                fi
+                ;;
+        esac
     fi
 
     # --- monitor ---
@@ -3895,7 +3966,7 @@ status_write_test() {
 status_one() {
     local script="$1" TARGET="" PORTAL="" MOUNT_PATH=""
     local service_name src fstype opts disk disc state sid rt live rt_show
-    local size used avail pct used_h size_h ds rc cutoff events last_line conf mode drop sess_up auth
+    local size used avail pct used_h size_h ds rc cutoff events last_line conf mode drop sess_up auth prov
 
     # shellcheck disable=SC1090
     source <(grep -E '^(TARGET|PORTAL|MOUNT_PATH)=' "$script" || true)
@@ -4023,16 +4094,37 @@ status_one() {
         if [[ -z "$disk" ]]; then
             disk=$(basename "$src")
         fi
+        prov=$(lun_provisioning "$disk")
         disc=$(cat "/sys/block/${disk}/queue/discard_max_bytes" 2>/dev/null || echo 0)
-        if [[ "$disc" =~ ^[0-9]+$ ]] && (( disc > 0 )); then
-            if systemctl is-active --quiet fstrim.timer 2>/dev/null; then
-                st_good "TRIM" "weekly - deleted backups give space back to the Synology"
-            else
-                st_warn "TRIM" "the LUN supports it, but fstrim.timer is not running"
-            fi
-        else
-            st_info "TRIM" "${DIM}not supported by this LUN (thick, or space reclamation is off)${NC}"
-        fi
+        case "$prov" in
+            thin)
+                st_info "LUN type" "thin ${DIM}· space reclamation is on${NC}"
+                if systemctl is-active --quiet fstrim.timer 2>/dev/null; then
+                    st_good "TRIM" "weekly - deleted backups give space back to the Synology"
+                else
+                    st_warn "TRIM" "the LUN supports it, but fstrim.timer is not running"
+                fi
+                ;;
+            thin-off)
+                st_info "LUN type" "thin"
+                st_warn "TRIM" "space reclamation is OFF on the Synology - deleted backups will not free space (DSM › SAN Manager › LUN › Edit)"
+                ;;
+            thick)
+                st_info "LUN type" "thick ${DIM}· space is reserved on the NAS${NC}"
+                st_info "TRIM" "${DIM}not needed on a thick LUN${NC}"
+                ;;
+            *)
+                if [[ "$disc" =~ ^[0-9]+$ ]] && (( disc > 0 )); then
+                    if systemctl is-active --quiet fstrim.timer 2>/dev/null; then
+                        st_good "TRIM" "weekly ${DIM}(LUN type not reported - space only comes back on a thin LUN)${NC}"
+                    else
+                        st_warn "TRIM" "the LUN supports it, but fstrim.timer is not running"
+                    fi
+                else
+                    st_info "TRIM" "${DIM}not supported by this LUN${NC}"
+                fi
+                ;;
+        esac
     fi
 
     # --- datastore ---
