@@ -15,7 +15,7 @@
 
 *Plain shell menus · CHAP · ext4 or XFS · keeps your data · repairs itself · live login dashboard*
 
-![version](https://img.shields.io/badge/version-1.7.6-2f81f7?style=for-the-badge)
+![version](https://img.shields.io/badge/version-1.7.7-2f81f7?style=for-the-badge)
 ![debian](https://img.shields.io/badge/Debian-13%20trixie-d70a53?style=for-the-badge&logo=debian&logoColor=white)
 ![pbs](https://img.shields.io/badge/Proxmox%20Backup%20Server-4.x-e57000?style=for-the-badge)
 ![bash](https://img.shields.io/badge/Bash-5.x-4eaa25?style=for-the-badge&logo=gnubash&logoColor=white)
@@ -69,7 +69,7 @@ This script walks you through the whole setup with questions first and changes s
 - **Health monitor every minute**: session, mount, read-only detection, and a real **write test**. It **repairs by itself** (unmount, logout, login, mount, restart PBS) with a cooldown.
 - **CHAP-aware**: a rejected login is logged **once** and retried every 15 minutes, not every minute.
 - **Alerts** (optional): push message (ntfy or any webhook) or email, only when the state **changes**.
-- **Weekly TRIM** when the LUN supports it, so pruned backups give space back to the Synology.
+- **Knows thin from thick**: the LUN reports its type, and the installer, `--status` and the login screen show it. **Weekly TRIM** only where it can help (thin LUN with space reclamation), so pruned backups give space back to the Synology. A thin LUN with reclamation switched off in DSM gets a warning.
 - Log rotation for the monitor log.
 
 ### Knows what is going on
@@ -95,7 +95,7 @@ This script walks you through the whole setup with questions first and changes s
    ██████╔╝██████╔╝███████╗   Proxmox Backup Server  4.2.8
    ██╔═══╝ ██╔══██╗╚════██║   iSCSI storage on Synology
    ██║     ██████╔╝███████║   ● ALL SYSTEMS HEALTHY
-   ╚═╝     ╚═════╝ ╚══════╝   pbs-motd v1.7.6 · by MorphyDK
+   ╚═╝     ╚═════╝ ╚══════╝   pbs-motd v1.7.7 · by MorphyDK
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   ╭─ Server
@@ -112,7 +112,7 @@ This script walks you through the whole setup with questions first and changes s
   │ Mount          ✔ /dev/sdb1 · 50GB · ext4 · read-write
   │ Space          ████████░░░░░░░░░░░░░░░░░░░░░░  27%
   │                36GB free  · 13GB used of 49GB
-  │ TRIM           weekly - deleted backups give space back to the Synology
+  │ LUN type       thin · weekly TRIM gives deleted backups back to the Synology
   │ Monitor        ✔ checks every minute, repairs by itself · last check 12s ago
   │ Last 24 hours  ✔ no problems logged
   ╰─
@@ -262,7 +262,7 @@ Both are fully supported for PBS datastores. PBS stores backups as many small ch
 | Old leftover iSCSI records | Listed by the installer and `--status`, and can be removed |
 | Repair loops | Cooldown of 5 minutes between automatic repairs |
 | Alert spam | Alerts only when the state changes (ok → problem, problem → ok) |
-| Space not given back | Weekly `fstrim` when the LUN reports discard support |
+| Space not given back | Weekly `fstrim` on thin LUNs with space reclamation. Thick LUNs are recognised and left alone (nothing to give back). Reclamation switched off in DSM is flagged |
 
 ---
 
