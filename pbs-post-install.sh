@@ -7,7 +7,7 @@
 # 
 # Thanks to Derek Seaman's Tech Blog who inspired me to make this.
 #
-# Version 1.7.7  20/10-2026
+# Version 1.9.1  21/10-2026
 # Author MorphyDK
 #
 # Usage:  ./pbs-post-install.sh              interactive installer
@@ -15,7 +15,39 @@
 #         ./pbs-post-install.sh --fix-login  re-enter the CHAP login of an installed target
 #         ./pbs-post-install.sh --motd       install / update only the login screen
 #         ./pbs-post-install.sh --motd-remove  remove the login screen again
+#         ./pbs-post-install.sh --motd-update  silent update of the login screen, keeps settings
 #         ./pbs-post-install.sh --help
+#
+# Changes in 1.9.1:
+#  - The reads/writes graph only uses characters that every terminal font has (· ░ ▒ ▓ █).
+#    Some fonts showed the thin block characters as empty boxes
+#
+# Changes in 1.9.0:
+#  - SELF-UPDATE. Once a day the login screen looks on GitHub (one request to api.github.com)
+#    for a newer release. When there is one it shows a sharp red "NEW VERSION" line, and one key
+#    (i at login, in the live dashboard, or pbs-menu > Installer update) installs it:
+#    download -> syntax/size/version check -> the current version is saved -> installed ->
+#    tested -> and put back automatically if anything fails. pbs-motd --rollback goes back by hand.
+#    Only the login screen and this script are replaced; iSCSI, mounts and datastores are never touched.
+#    Settings: turn the check off, or turn on automatic installation (off by default)
+#  - Live dashboard: a third login style that stays open and refreshes until you press q, with a
+#    key bar: m menu, l log, c repair, p page, h help, and u / i / r when an update, a new
+#    installer or a reboot is waiting. Also: pbs-motd --live
+#  - Live view: reads/writes per second as a small graph, plus the average latency to the NAS
+#  - The login screen scripts are replaced with an atomic rename, so an update never rewrites a
+#    file that is running
+#
+# Changes in 1.8.0:
+#  - Login screen: an UPDATE ALERT. When packages can be upgraded the dashboard shows a sharp
+#    red (blinking where the terminal supports it) "N UPDATE(S) AVAILABLE" line; kernel and core
+#    updates are marked as needing a reboot
+#  - Press u at login to install the updates (asks first, lists the packages, warns when
+#    backups are running); s snoozes the question for 24 hours. Also in pbs-menu > System updates
+#  - After an upgrade, or whenever a newer kernel is installed than the one running, a strong
+#    "REBOOT RECOMMENDED" alert with a reboot question (press r at login)
+#  - Fixed: the "updates available" count could stay old after you had upgraded. It is now
+#    refreshed by an apt hook, and at login whenever apt or dpkg changed since
+#  - Settings: the update question can be turned off (pbs-menu > Settings)
 #
 # Changes in 1.7.7:
 #  - Detects thin vs thick LUNs (the disk reports it) and says so: the installer, --status and
@@ -93,7 +125,7 @@
 set -eE
 export LC_ALL=C.UTF-8
 
-VERSION="1.7.7"
+VERSION="1.9.1"
 LOG_FILE="/var/log/pbs-post-install.log"
 FS_LABEL="pbs-data"
 FOUR_TIB=4398046511104
@@ -145,7 +177,7 @@ DO_ISCSI=1
 DO_DS=1
 DO_NAG=1
 DO_MOTD=1
-MOTD_MODE="prompt"   # prompt | dashboard
+MOTD_MODE="prompt"   # prompt | dashboard | live
 GUIDE_DONE=0
 declare -a NOTES=()
 OS_CODENAME=""
@@ -2088,27 +2120,29 @@ setup_mount_ds() {
 }
 
 setup_motd() {
-    local choice def=0
+    local choice def=0 cur
     if [[ $DO_MOTD -ne 1 ]]; then
         return 0
     fi
-    if [[ "$MOTD_MODE" == "dashboard" ]]; then
-        def=1
-    fi
+    # an earlier choice (also made in pbs-menu > Settings) is the preselected one
+    cur=$(motd_conf_val MODE)
+    case "$cur" in dashboard|live|prompt) MOTD_MODE="$cur" ;; esac
+    case "$MOTD_MODE" in dashboard) def=1 ;; live) def=2 ;; esac
     echo
     panel_top "Login screen"
     panel_line "When you log in you are met by a live dashboard: server health,"
     panel_line "the Synology connection, free space and the latest backups."
-    panel_line "Press ${CYAN}m${NC} for a menu: live view, repair, logs and help."
+    panel_line "Press ${CYAN}m${NC} for a menu: live view, repair, logs, updates and help."
     panel_bottom
     menu_select choice "$def" \
         "Dashboard + menu prompt|After the dashboard press m for the menu - it waits 5 seconds, then your shell" \
-        "Dashboard only|Shows the dashboard and your shell right away - the menu is still there as: pbs-menu"
-    if [[ $choice -eq 1 ]]; then
-        MOTD_MODE="dashboard"
-    else
-        MOTD_MODE="prompt"
-    fi
+        "Dashboard only|Shows the dashboard and your shell right away - the menu is still there as: pbs-menu" \
+        "Live dashboard|Stays open and refreshes every 3 seconds until you press q - with a key bar (menu, log, repair, updates)"
+    case "$choice" in
+        1) MOTD_MODE="dashboard" ;;
+        2) MOTD_MODE="live" ;;
+        *) MOTD_MODE="prompt" ;;
+    esac
 }
 
 setup_review() {
@@ -2160,7 +2194,7 @@ setup_review() {
         kv "Datastore" "no"
     fi
     kv "Popup" "$( [[ $DO_NAG -eq 1 ]] && echo 'remove the subscription popup' || echo 'unchanged' )"
-    kv "Login screen" "$( [[ $DO_MOTD -eq 1 ]] && echo "live dashboard (${MOTD_MODE/prompt/with menu prompt})" || echo 'unchanged' )"
+    kv "Login screen" "$( [[ $DO_MOTD -eq 1 ]] && case "$MOTD_MODE" in prompt) echo 'dashboard + menu prompt' ;; dashboard) echo 'dashboard only' ;; live) echo 'live dashboard (stays open until q)' ;; esac || echo 'unchanged' )"
     panel_bottom
     menu_select choice 0 \
         "Start the installation|Runs on its own from here - grab a coffee" \
@@ -2786,12 +2820,18 @@ write_motd_script() {
 #   pbs-motd              show the dashboard
 #   pbs-motd --login      what runs at login (honours MODE in /etc/pbs-motd.conf)
 #   pbs-motd --watch      live view, refreshes every 3 seconds
+#   pbs-motd --update-installer   install the newest release (asks first)
+#   pbs-motd --rollback   go back to the version before the last update
 #   pbs-motd --menu       interactive menu   (also: pbs-menu)
 #   pbs-motd --help       key commands       (also: pbs-help)
 export LC_ALL=C.UTF-8
 CONF=/etc/pbs-motd.conf
-MODE="prompt"          # off | dashboard | prompt
+MODE="prompt"          # off | dashboard | prompt | live
 PROMPT_SECS=5
+UPDATE_PROMPT=1        # 1 = at login, offer to install available updates
+UPDATE_CHECK=1         # 1 = look once a day on GitHub for a newer version of this installer
+AUTO_UPDATE=0          # 1 = also install a newer version by itself (off by default)
+REFRESH_SECS=3         # live dashboard: seconds between redraws
 if [ -r "$CONF" ] && [ "$(stat -c %u "$CONF" 2>/dev/null)" = "0" ]; then
     # shellcheck disable=SC1090
     . "$CONF"
@@ -2801,18 +2841,25 @@ DS_CFG="${DS_CFG:-/etc/proxmox-backup/datastore.cfg}"
 TASK_DIR=/var/log/proxmox-backup/tasks
 MON_LOG=/var/log/iscsi-monitor.log
 UPD_FILE=/var/lib/pbs-motd/updates
+REL_FILE=/var/lib/pbs-motd/release
+BACKUP_DIR=/var/lib/pbs-motd/backup
+UPD_LOG=/var/log/pbs-motd-update.log
+GH_REPO="${GH_REPO:-MorphyDK/pbs-synology-iscsi}"
+SNOOZE_FILE=/var/lib/pbs-motd/snooze
+BOOT_DIR="${BOOT_DIR:-/boot}"
 
 # ---------------------------------------------------------------- colours
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
     RED=$'\e[1;31m'; GREEN=$'\e[1;32m'; YELLOW=$'\e[1;33m'; BLUE=$'\e[1;34m'
     CYAN=$'\e[1;36m'; WHITE=$'\e[1;37m'; DIM=$'\e[2m'; NC=$'\e[0m'
+    ALERT=$'\e[1;5;97;41m'      # bold, blinking where the terminal supports it, white on sharp red
     if [ "$(tput colors 2>/dev/null || echo 8)" -ge 256 ]; then
         GRAD=($'\e[38;5;51m' $'\e[38;5;45m' $'\e[38;5;39m' $'\e[38;5;33m' $'\e[38;5;27m' $'\e[38;5;21m')
     else
         GRAD=("$CYAN" "$CYAN" "$CYAN" "$BLUE" "$BLUE" "$BLUE")
     fi
 else
-    RED=""; GREEN=""; YELLOW=""; BLUE=""; CYAN=""; WHITE=""; DIM=""; NC=""
+    RED=""; GREEN=""; YELLOW=""; BLUE=""; CYAN=""; WHITE=""; DIM=""; NC=""; ALERT=""
     GRAD=("" "" "" "" "" "")
 fi
 PANEL_C="$BLUE"
@@ -2897,8 +2944,360 @@ gather_sessions() {
     SESS3=$(timeout 10 iscsiadm -m session -P 3 2>/dev/null)
 }
 
+# ---------------------------------------------------------------- updates
+# Cache file: COUNT|TIMESTAMP|IMPORTANT(0/1)|first package names.
+# Written by the apt hook after every apt update / dpkg run, daily by cron, and again at
+# login when dpkg or apt changed since it was written - so it never shows old news.
+refresh_updates() {
+    local raw out n imp names
+    mkdir -p "$(dirname "$UPD_FILE")"
+    raw=$(timeout 30 apt-get -s dist-upgrade 2>/dev/null) || return 0
+    out=$(awk '/^Inst /{print $2}' <<< "$raw")
+    n=0
+    [ -n "$out" ] && n=$(printf '%s\n' "$out" | wc -l)
+    imp=0
+    if printf '%s\n' "$out" | grep -Eq '^(proxmox-kernel|pve-kernel|linux-image|proxmox-backup-server$|libc6$|systemd$|udev$)'; then
+        imp=1
+    fi
+    names=$(printf '%s\n' "$out" | head -n 6 | paste -sd, -)
+    [ "$n" -gt 6 ] && names="${names},…"
+    echo "${n}|$(date +%s)|${imp}|${names}" > "$UPD_FILE"
+}
+
+UPD_N=""; UPD_STAMP=0; UPD_IMP=0; UPD_NAMES=""
+load_updates() {
+    local mt
+    UPD_N=""; UPD_STAMP=0; UPD_IMP=0; UPD_NAMES=""
+    mt=$(stat -c %Y "$UPD_FILE" 2>/dev/null || echo 0)
+    if [ "$(id -u)" -eq 0 ]; then
+        if [ ! -r "$UPD_FILE" ] || [ /var/lib/dpkg/status -nt "$UPD_FILE" ] \
+            || [ /var/lib/apt/lists -nt "$UPD_FILE" ] || [ $(( $(date +%s) - mt )) -gt 21600 ]; then
+            refresh_updates
+        fi
+    fi
+    if [ -r "$UPD_FILE" ]; then
+        IFS='|' read -r UPD_N UPD_STAMP UPD_IMP UPD_NAMES < "$UPD_FILE"
+    fi
+    case "$UPD_N" in ''|*[!0-9]*) UPD_N="" ;; esac
+    return 0
+}
+
+# Is a newer kernel installed than the one that is running?
+REBOOT_NEEDED=0; RUNNING_K=""; INSTALLED_K=""
+reboot_info() {
+    local newest
+    RUNNING_K=$(uname -r)
+    newest=$(ls -1 "$BOOT_DIR"/vmlinuz-* 2>/dev/null | sed 's#.*/vmlinuz-##' | sort -V | tail -n 1)
+    INSTALLED_K="${newest:-$RUNNING_K}"
+    REBOOT_NEEDED=0
+    [ -f /var/run/reboot-required ] && REBOOT_NEEDED=1
+    if [ "$(printf '%s\n%s\n' "$RUNNING_K" "$INSTALLED_K" | sort -V | tail -n 1)" != "$RUNNING_K" ]; then
+        REBOOT_NEEDED=1
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------- installer updates
+# Once a day (cron, or in the background at login when the cache is old) the newest release
+# tag is read from GitHub: one small request to api.github.com, nothing is sent about you.
+# Cache file: LATEST|LAST_OK|LAST_TRY   (seconds since 1970)
+ver_gt() {   # ver_gt A B -> true when A is a newer version than B
+    [ -n "$1" ] && [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" = "$1" ]
+}
+
+http_get() {   # http_get URL  -> body on stdout
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --max-time 25 -H 'User-Agent: pbs-motd' "$1"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO- --timeout=25 --user-agent=pbs-motd "$1"
+    else
+        return 127
+    fi
+}
+
+check_release() {
+    local json new tag ok try now
+    now=$(date +%s)
+    mkdir -p "$(dirname "$REL_FILE")"
+    tag=""; ok=0; try=0
+    [ -r "$REL_FILE" ] && IFS='|' read -r tag ok try < "$REL_FILE"
+    json=$(http_get "https://api.github.com/repos/${GH_REPO}/releases/latest" 2>/dev/null) || json=""
+    new=$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' <<< "$json" | head -n 1)
+    new=${new#v}
+    case "$new" in
+        [0-9]*) echo "${new}|${now}|${now}" > "$REL_FILE"; return 0 ;;
+    esac
+    echo "${tag:-}|${ok:-0}|${now}" > "$REL_FILE"
+    return 1
+}
+
+REL_LATEST=""; REL_NEW=0; REL_OK=0; REL_TRY=0; REL_SKIPPED=0
+load_release() {
+    local now skip
+    REL_LATEST=""; REL_NEW=0; REL_OK=0; REL_TRY=0; REL_SKIPPED=0
+    [ "$UPDATE_CHECK" = "1" ] || [ "${1:-}" = "force" ] || return 0
+    [ -r "$REL_FILE" ] && IFS='|' read -r REL_LATEST REL_OK REL_TRY < "$REL_FILE"
+    case "$REL_OK" in ''|*[!0-9]*) REL_OK=0 ;; esac
+    case "$REL_TRY" in ''|*[!0-9]*) REL_TRY=0 ;; esac
+    skip=$(cat "$BACKUP_DIR/skip" 2>/dev/null)
+    if ver_gt "$REL_LATEST" "${PBS_MOTD_VERSION:-0}"; then
+        if [ "$REL_LATEST" = "$skip" ]; then REL_SKIPPED=1; else REL_NEW=1; fi
+    fi
+    # Cache older than a day (the server was off at the cron hour)? Look again in the background
+    if [ "$(id -u)" -eq 0 ] && [ "$UPDATE_CHECK" = "1" ]; then
+        now=$(date +%s)
+        if [ $(( now - REL_OK )) -gt 90000 ] && [ $(( now - REL_TRY )) -gt 21600 ]; then
+            echo "${REL_LATEST}|${REL_OK}|${now}" > "$REL_FILE" 2>/dev/null
+            ( timeout 60 /usr/local/sbin/pbs-motd --check-release </dev/null >/dev/null 2>&1 & )
+        fi
+    fi
+    return 0
+}
+
+ulog() {   # ulog "text" - screen unless quiet, and the log file
+    [ "${QUIET_UPDATE:-0}" = "1" ] || echo "  $*"
+    printf '%s %s\n' "$(date '+%F %T')" "$(sed 's/\x1b\[[0-9;]*m//g' <<< "$*")" >> "$UPD_LOG" 2>/dev/null
+    return 0
+}
+
+restore_version() {   # restore_version VERSION - copy the saved files back (atomic rename)
+    local v="$1" name
+    for name in pbs-motd pbs-post-install.sh; do
+        if [ -f "$BACKUP_DIR/$name.$v" ]; then
+            cp -p "$BACKUP_DIR/$name.$v" "/usr/local/sbin/$name.new" \
+                && mv -f "/usr/local/sbin/$name.new" "/usr/local/sbin/$name"
+        fi
+    done
+    if [ -f "$BACKUP_DIR/pbs-motd.conf.$v" ]; then
+        cp -p "$BACKUP_DIR/pbs-motd.conf.$v" "$CONF"
+    fi
+}
+
+prune_backups() {   # keep the 3 newest saved versions
+    local f
+    for f in pbs-motd pbs-motd.conf pbs-post-install.sh; do
+        # shellcheck disable=SC2012
+        ls -1t "$BACKUP_DIR/$f".[0-9]* 2>/dev/null | tail -n +4 | xargs -r rm -f
+    done
+}
+
+# installer_update [auto]  - download, check, install; goes back by itself when anything fails
+UPDATED=0
+installer_update() {
+    local mode="${1:-ask}" old="${PBS_MOTD_VERSION:-0}" tmp url tag fver got=0 inst=/usr/local/sbin
+    UPDATED=0
+    QUIET_UPDATE=0; [ "$mode" = auto ] && QUIET_UPDATE=1
+    need_root || return 1
+    exec 9>/var/lock/pbs-motd-update.lock
+    flock -n 9 || { ulog "${YELLOW}Another update is running.${NC}"; return 1; }
+    if [ "$mode" != auto ]; then
+        echo
+        printf '  %sLooking for a newer version…%s' "$DIM" "$NC"
+        if ! check_release; then
+            printf '\r\e[K'
+            ulog "${YELLOW}⚠ Could not reach GitHub (https://github.com/${GH_REPO}). Try again later.${NC}"
+            return 1
+        fi
+        printf '\r\e[K'
+    fi
+    load_release force
+    if [ -z "$REL_LATEST" ]; then
+        ulog "${YELLOW}⚠ Could not reach GitHub (https://github.com/${GH_REPO}). Try again later.${NC}"
+        return 1
+    fi
+    if ! ver_gt "$REL_LATEST" "$old"; then
+        ulog "${GREEN}✔ You have the newest version (v${old}).${NC}"
+        return 0
+    fi
+    if [ "$mode" != auto ]; then
+        echo
+        panel_top "New version of this installer" "$YELLOW"
+        kv "Installed" "v${old}"
+        kv "Available" "${WHITE}v${REL_LATEST}${NC}"
+        kv "Release notes" "${DIM}https://github.com/${GH_REPO}/releases${NC}"
+        panel_blank
+        panel_line "Only the login screen and the installer script are replaced."
+        panel_line "${DIM}Your iSCSI connection, mount, datastores and backups are not touched.${NC}"
+        panel_line "${DIM}The current version is saved first - pbs-motd --rollback goes back.${NC}"
+        panel_bottom
+        ask_yn "Install v${REL_LATEST} now?" || { echo "  ${DIM}Nothing was changed.${NC}"; return 0; }
+    fi
+    tmp=$(mktemp /tmp/pbs-post-install.XXXXXX) || return 1
+    for tag in "v${REL_LATEST}" "${REL_LATEST}"; do
+        url="https://raw.githubusercontent.com/${GH_REPO}/${tag}/pbs-post-install.sh"
+        if http_get "$url" > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then got=1; break; fi
+    done
+    if [ "$got" -ne 1 ]; then
+        ulog "${RED}✘ The download failed - nothing was changed.${NC}"
+        rm -f "$tmp"; return 1
+    fi
+    # --- check the file before it is allowed anywhere near the system ---
+    fver=$(sed -n 's/^VERSION="\([^"]*\)".*/\1/p' "$tmp" | head -n 1)
+    if [ "$(stat -c %s "$tmp")" -lt 50000 ] || [ "$(head -c 11 "$tmp")" != '#!/bin/bash' ] \
+        || ! bash -n "$tmp" 2>/dev/null || ! grep -q -- '--motd-update' "$tmp"; then
+        ulog "${RED}✘ The downloaded file does not look right (syntax or size check failed) - nothing was changed.${NC}"
+        rm -f "$tmp"; return 1
+    fi
+    if [ "$fver" != "$REL_LATEST" ]; then
+        ulog "${RED}✘ The file says v${fver:-?} but the release is v${REL_LATEST} - nothing was changed.${NC}"
+        mkdir -p "$BACKUP_DIR"; echo "$REL_LATEST" > "$BACKUP_DIR/skip"
+        rm -f "$tmp"; return 1
+    fi
+    ulog "${GREEN}✔${NC} Downloaded v${fver} and checked it"
+    # --- save the current version ---
+    mkdir -p "$BACKUP_DIR"
+    [ -f "$inst/pbs-motd" ] && cp -p "$inst/pbs-motd" "$BACKUP_DIR/pbs-motd.$old"
+    [ -f "$inst/pbs-post-install.sh" ] && cp -p "$inst/pbs-post-install.sh" "$BACKUP_DIR/pbs-post-install.sh.$old"
+    [ -f "$CONF" ] && cp -p "$CONF" "$BACKUP_DIR/pbs-motd.conf.$old"
+    ulog "${GREEN}✔${NC} Saved v${old} in ${BACKUP_DIR}"
+    # --- install, then try it; on any failure put the old files back ---
+    if bash "$tmp" --motd-update >/dev/null 2>&1 \
+        && [ "$("$inst/pbs-motd" --version 2>/dev/null)" = "pbs-motd v${fver}" ] \
+        && bash -n "$inst/pbs-motd" 2>/dev/null && bash -n "$inst/pbs-post-install.sh" 2>/dev/null \
+        && NO_COLOR=1 timeout 90 "$inst/pbs-motd" >/dev/null 2>&1; then
+        rm -f "$BACKUP_DIR/skip"
+        prune_backups
+        UPDATED=1
+        ulog "${GREEN}✔ Updated to v${fver}.${NC} It is active at the next login (or now: pbs-motd)."
+    else
+        restore_version "$old"
+        echo "$REL_LATEST" > "$BACKUP_DIR/skip"
+        ulog "${RED}✘ v${fver} did not pass the test - v${old} has been put back.${NC}"
+        ulog "${DIM}This version will not be tried again automatically. Log: ${UPD_LOG}${NC}"
+        rm -f "$tmp"; return 1
+    fi
+    rm -f "$tmp"
+    return 0
+}
+
+do_rollback() {
+    local f v
+    need_root || return 1
+    # shellcheck disable=SC2012
+    f=$(ls -1t "$BACKUP_DIR"/pbs-motd.[0-9]* 2>/dev/null | head -n 1)
+    if [ -z "$f" ]; then
+        echo "  ${YELLOW}No earlier version is saved.${NC}"
+        return 1
+    fi
+    v=${f##*/pbs-motd.}
+    echo
+    ask_yn "Go back to v${v} (the version before the last update)?" || return 0
+    restore_version "$v"
+    mkdir -p "$BACKUP_DIR"; echo "${PBS_MOTD_VERSION:-}" > "$BACKUP_DIR/skip"
+    ulog "${GREEN}✔ Back on v${v}.${NC} The newer version will not be offered again until a newer one appears."
+}
+
+# Daily job: read the newest tag; install it when AUTO_UPDATE=1
+run_check_release() {
+    [ "$UPDATE_CHECK" = "1" ] || return 0
+    check_release || true
+    load_release
+    if [ "$AUTO_UPDATE" = "1" ] && [ "$REL_NEW" -eq 1 ]; then
+        installer_update auto
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------- traffic to the NAS
+# The live views sample /sys/block/<disk>/stat every refresh and keep the last 20 values.
+declare -A IO_PREV IO_RH IO_WH IO_LR IO_LW
+IO_LIVE=0
+IO_POINTS=20
+
+mount_disk() {   # mount_disk /mnt/path -> disk name (sdb)
+    local src dd
+    src=$(findmnt -rn -M "$1" -o SOURCE 2>/dev/null)
+    [ -n "$src" ] || return 1
+    dd=$(lsblk -no PKNAME "$src" 2>/dev/null | head -n 1)
+    [ -n "$dd" ] || dd=$(basename "$src")
+    echo "$dd"
+}
+
+sample_io() {
+    local s MOUNT_PATH dd a b c d e f g h cs pcs pa pc pd pe pg ph dt rr wr dio lr lw prev hist
+    cs=$(cut -d' ' -f1 /proc/uptime)
+    cs=$(( 10#${cs/./} ))
+    IO_LIVE=1
+    while read -r -u 3 s; do
+        [ -z "$s" ] && continue
+        MOUNT_PATH=""
+        # shellcheck disable=SC1090
+        source <(grep -E '^MOUNT_PATH=' "$s")
+        dd=$(mount_disk "$MOUNT_PATH") || continue
+        [ -r "/sys/block/${dd}/stat" ] || continue
+        read -r a b c d e f g h _ < "/sys/block/${dd}/stat"
+        prev="${IO_PREV[$dd]:-}"
+        IO_PREV[$dd]="$cs $a $c $d $e $g $h"
+        [ -n "$prev" ] || continue
+        read -r pcs pa pc pd pe pg ph <<< "$prev"
+        dt=$(( cs - pcs ))
+        [ "$dt" -ge 1 ] || continue
+        rr=$(( (c - pc) * 512 * 100 / dt ))
+        wr=$(( (g - pg) * 512 * 100 / dt ))
+        dio=$(( a - pa )); lr=0
+        [ "$dio" -gt 0 ] && lr=$(( (d - pd) / dio ))
+        dio=$(( e - pe )); lw=0
+        [ "$dio" -gt 0 ] && lw=$(( (h - ph) / dio ))
+        [ "$rr" -lt 0 ] && rr=0
+        [ "$wr" -lt 0 ] && wr=0
+        # shellcheck disable=SC2086
+        { set -- ${IO_RH[$dd]:-} "$rr"; while [ $# -gt "$IO_POINTS" ]; do shift; done; IO_RH[$dd]="$*"; }
+        # shellcheck disable=SC2086
+        { set -- ${IO_WH[$dd]:-} "$wr"; while [ $# -gt "$IO_POINTS" ]; do shift; done; IO_WH[$dd]="$*"; }
+        IO_LR[$dd]="$lr"; IO_LW[$dd]="$lw"
+    done 3< <(mon_scripts)
+}
+
+spark() {   # spark MAX v1 v2 ... -> · ░ ▒ ▓ █   (only characters every terminal font has)
+    local max="$1" v i out=""
+    local -a blocks=(· ░ ▒ ▓ █)
+    shift
+    [ "$max" -lt 1 ] && max=1
+    for v in "$@"; do
+        if [ "$v" -le 0 ]; then i=0; else i=$(( 1 + v * 3 / max )); fi
+        [ "$i" -gt 4 ] && i=4
+        out+="${blocks[i]}"
+    done
+    printf '%s' "$out"
+}
+
+rate_fmt() {
+    awk -v b="${1:-0}" 'BEGIN {
+        if (b >= 1073741824) printf "%.1f GB/s", b / 1073741824
+        else if (b >= 1048576) printf "%.1f MB/s", b / 1048576
+        else if (b >= 1024) printf "%.0f KB/s", b / 1024
+        else printf "%d B/s", b }'
+}
+
+lat_colour() {   # milliseconds per request
+    if [ "$1" -ge 1000 ]; then printf '%s' "$RED"
+    elif [ "$1" -ge 200 ]; then printf '%s' "$YELLOW"
+    else printf '%s' "$GREEN"; fi
+}
+
+panel_io() {
+    local dd="$1" rh wh max v rn wn rpk=0 wpk=0 lr lw
+    rh="${IO_RH[$dd]:-}"; wh="${IO_WH[$dd]:-}"
+    if [ -z "$rh" ]; then
+        kv "Traffic" "${DIM}measuring…${NC}"
+        return 0
+    fi
+    max=1048576    # a flat line below 1 MB/s, so an idle disk looks idle
+    # shellcheck disable=SC2086
+    for v in $rh; do [ "$v" -gt "$max" ] && max=$v; [ "$v" -gt "$rpk" ] && rpk=$v; done
+    # shellcheck disable=SC2086
+    for v in $wh; do [ "$v" -gt "$max" ] && max=$v; [ "$v" -gt "$wpk" ] && wpk=$v; done
+    rn=${rh##* }; wn=${wh##* }
+    lr="${IO_LR[$dd]:-0}"; lw="${IO_LW[$dd]:-0}"
+    # shellcheck disable=SC2086
+    kv "Reads" "${CYAN}$(spark "$max" $rh)${NC} ${WHITE}$(rate_fmt "$rn")${NC}  ${DIM}peak $(rate_fmt "$rpk")${NC}"
+    # shellcheck disable=SC2086
+    kv "Writes" "${CYAN}$(spark "$max" $wh)${NC} ${WHITE}$(rate_fmt "$wn")${NC}  ${DIM}peak $(rate_fmt "$wpk")${NC}"
+    kv "Latency" "read $(lat_colour "$lr")${lr} ms${NC} · write $(lat_colour "$lw")${lw} ms${NC}  ${DIM}average per request, last refresh${NC}"
+}
+
 panel_server() {
-    local os kernel up load ncpu mt ma mpct rsz rused rpct d h m upd stamp n=0
+    local os kernel up load ncpu mt ma mpct rsz rused rpct d h m
     os=$( . /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-Linux}" )
     kernel=$(uname -r)
     up=$(cut -d' ' -f1 /proc/uptime | cut -d. -f1)
@@ -2918,16 +3317,31 @@ panel_server() {
     kv "Uptime" "$( [ "$d" -gt 0 ] && echo "${d}d " )${h}h ${m}m   ${DIM}load ${load}  (${ncpu} cores)${NC}"
     kv "Memory" "$(bar "$mpct")  ${DIM}$(hb $(( (mt - ma) * 1024 ))) of $(hb $(( mt * 1024 )))${NC}"
     kv "System disk" "$(bar "$rpct")  ${DIM}$(hb "${rused:-0}") of $(hb "${rsz:-0}")${NC}"
-    if [ -r "$UPD_FILE" ]; then
-        IFS='|' read -r upd stamp < "$UPD_FILE"
-        case "$upd" in
-            ''|*[!0-9]*) ;;
-            0) st_good "Updates" "up to date ${DIM}(checked $(age $(( $(date +%s) - ${stamp:-0} ))))${NC}" ;;
-            *) kv "Updates" "${YELLOW}${upd} package(s) can be upgraded${NC}   ${DIM}apt update && apt full-upgrade${NC}" ;;
-        esac
+    load_updates
+    reboot_info
+    if [ -n "$UPD_N" ]; then
+        if [ "$UPD_N" -eq 0 ]; then
+            st_good "Updates" "up to date ${DIM}(checked $(age $(( $(date +%s) - ${UPD_STAMP:-0} ))))${NC}"
+        else
+            kv "Updates" "${ALERT} ⚠ ${UPD_N} UPDATE(S) AVAILABLE ${NC}  ${DIM}$(trunc "$UPD_NAMES" $(( COLS - 44 )))${NC}"
+            if [ "$UPD_IMP" = "1" ]; then
+                kv "" "${RED}Kernel or core update - a reboot is needed afterwards${NC}"
+            fi
+            kv "" "${DIM}Install: press u at login, or pbs-menu › System updates${NC}"
+        fi
     fi
-    if [ -f /var/run/reboot-required ]; then
-        kv "Reboot" "${YELLOW}needed to finish updates${NC}"
+    if [ "$REBOOT_NEEDED" -eq 1 ]; then
+        kv "Reboot" "${ALERT} ⚠ REBOOT RECOMMENDED ${NC}  ${DIM}running ${RUNNING_K}, installed ${INSTALLED_K}${NC}"
+        WARNINGS=$(( WARNINGS + 1 ))
+    fi
+    load_release
+    if [ "$REL_NEW" -eq 1 ]; then
+        kv "Installer" "${ALERT} ⚠ NEW VERSION v${REL_LATEST} ${NC}  ${DIM}you have v${PBS_MOTD_VERSION:-?}${NC}"
+        kv "" "${DIM}Install: press i at login, or pbs-menu › Installer update${NC}"
+    elif [ "$REL_SKIPPED" -eq 1 ]; then
+        kv "Installer" "v${PBS_MOTD_VERSION:-?} ${DIM}· v${REL_LATEST} exists but was rolled back here - not offered again${NC}"
+    elif [ "$UPDATE_CHECK" = "1" ] && [ "$REL_OK" -gt 0 ]; then
+        st_good "Installer" "v${PBS_MOTD_VERSION:-?} ${DIM}· newest version (checked $(age $(( $(date +%s) - REL_OK ))))${NC}"
     fi
     panel_bottom
 }
@@ -3012,6 +3426,7 @@ panel_iscsi() {
                 fi
                 ;;
         esac
+        if [ "$IO_LIVE" = "1" ]; then panel_io "$dd"; fi
     fi
 
     # --- monitor ---
@@ -3145,7 +3560,9 @@ banner() {
         "${DIM}pbs-motd v${PBS_MOTD_VERSION:-?} · by MorphyDK${NC}"
     )
     echo
-    if [ "$COLS" -ge 76 ]; then
+    if [ "${SLIM:-0}" = "1" ]; then
+        printf '  %s%s%s  %s%s%s  %s  %s\n' "$WHITE" "$host" "$NC" "$DIM" "$IP" "$NC" "$pill" "${DIM}v${PBS_MOTD_VERSION:-?}${NC}"
+    elif [ "$COLS" -ge 76 ]; then
         for (( i = 0; i < 6; i++ )); do
             printf '   %s%s%s   %s\n' "${GRAD[i]}" "${art[i]}" "$NC" "${side[i]}"
         done
@@ -3324,6 +3741,7 @@ screen_watch() {
     printf '\e[?25l\e[2J'
     trap 'printf "\e[?25h"; exit 0' INT TERM
     while true; do
+        sample_io
         out=$(render_dashboard 2>&1)
         printf '\e[H%s\n' "$(sed 's/$/\x1b[K/' <<< "$out")"
         printf '\n  %sLive view · refreshes every 3 seconds · %s · q to quit%s\e[K\n\e[J' "$DIM" "$(date '+%H:%M:%S')" "$NC"
@@ -3470,35 +3888,162 @@ screen_services() {
     done
 }
 
-screen_settings() {
-    local c cur=1
-    case "$MODE" in off) cur=2 ;; dashboard) cur=0 ;; esac
+running_tasks() {
+    local n
+    n=$(grep -c '^UPID:' "$TASK_DIR/active" 2>/dev/null)
+    echo "${n:-0}"
+}
+
+do_reboot() {
+    local n
+    n=$(running_tasks)
     echo
-    panel_top "Login screen"
-    kv "Now" "${MODE}"
-    panel_blank
-    panel_line "${DIM}Applies from the next login.${NC}"
+    if [ "$n" -gt 0 ]; then
+        echo "  ${RED}⚠ ${n} backup task(s) are running - a reboot will interrupt them.${NC}"
+    fi
+    if ask_yn "Reboot the server now?"; then
+        echo "  ${CYAN}Rebooting…${NC}"
+        systemctl reboot
+        sleep 5
+    fi
+}
+
+# Check, show and (after a yes) install the available updates
+do_update() {
+    local raw n tasks line
+    need_root || return 1
+    echo
+    printf '  %sChecking for updates…%s' "$DIM" "$NC"
+    if ! timeout 180 apt-get -q update >/dev/null 2>&1; then
+        printf '\r\e[K'
+        echo "  ${YELLOW}⚠ apt update reported problems (a repository may be unreachable).${NC}"
+        echo "  ${DIM}Run apt update to see the details.${NC}"
+    else
+        printf '\r\e[K'
+    fi
+    refresh_updates
+    load_updates
+    if [ -z "$UPD_N" ] || [ "$UPD_N" -eq 0 ]; then
+        echo "  ${GREEN}✔ The system is up to date.${NC}"
+        return 0
+    fi
+    raw=$(timeout 30 apt-get -s dist-upgrade 2>/dev/null | awk '/^Inst /{print $2 " " $3 " -> " $4}' | tr -d '[]()')
+    echo
+    panel_top "${UPD_N} update(s) available" "$YELLOW"
+    n=0
+    while IFS= read -r line; do
+        n=$(( n + 1 ))
+        [ "$n" -gt 15 ] && { panel_line "${DIM}… and $(( UPD_N - 15 )) more${NC}"; break; }
+        panel_line "$(trunc "$line" $(( COLS - 6 )))"
+    done <<< "$raw"
     panel_bottom
-    menu_select c "$cur" \
-        "Dashboard only|Shows the dashboard at login, then your shell" \
-        "Dashboard + menu prompt|After the dashboard: press m for the menu, h for help (${PROMPT_SECS}s, then the shell)" \
-        "Off|No login screen - pbs-menu still works"
-    case "$c" in
-        0) MODE=dashboard ;;
-        1) MODE=prompt ;;
-        2) MODE=off ;;
-        *) return 0 ;;
-    esac
+    if [ "$UPD_IMP" = "1" ]; then
+        echo
+        panel_top "Kernel or core update" "$RED"
+        panel_line "${ALERT} ⚠ A REBOOT IS NEEDED AFTERWARDS ${NC}"
+        panel_line "The new kernel only runs after a reboot. Plan it for a quiet moment."
+        panel_bottom
+    fi
+    tasks=$(running_tasks)
+    if [ "$tasks" -gt 0 ]; then
+        echo "  ${RED}⚠ ${tasks} backup task(s) are running - the PBS services restart during an upgrade and may interrupt them.${NC}"
+    fi
+    ask_yn "Install the ${UPD_N} update(s) now?" || { echo "  ${DIM}Nothing was installed.${NC}"; return 0; }
+    echo
+    if DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none \
+        apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold full-upgrade; then
+        echo
+        echo "  ${GREEN}✔ Updates installed.${NC}"
+    else
+        echo
+        echo "  ${RED}✘ The upgrade reported errors - see the output above.${NC}"
+    fi
+    refresh_updates
+    load_updates
+    reboot_info
+    if [ "$REBOOT_NEEDED" -eq 1 ] || [ "$UPD_IMP" = "1" ]; then
+        echo
+        panel_top "Reboot" "$RED"
+        panel_line "${ALERT} ⚠ REBOOT STRONGLY RECOMMENDED ${NC}"
+        panel_line "Running kernel ${RUNNING_K}, installed ${INSTALLED_K}."
+        panel_line "${DIM}The iSCSI disk reconnects by itself after the reboot.${NC}"
+        panel_bottom
+        do_reboot
+    fi
+    return 0
+}
+
+snoozed() {
+    local until
+    until=$(cat "$SNOOZE_FILE" 2>/dev/null || echo 0)
+    [ "$(date +%s)" -lt "${until:-0}" ]
+}
+
+save_conf() {
     need_root || return 0
-    printf 'MODE=%s\nPROMPT_SECS=%s\n' "$MODE" "$PROMPT_SECS" > "$CONF"
+    printf 'MODE=%s\nPROMPT_SECS=%s\nUPDATE_PROMPT=%s\nUPDATE_CHECK=%s\nAUTO_UPDATE=%s\nREFRESH_SECS=%s\n' \
+        "$MODE" "$PROMPT_SECS" "$UPDATE_PROMPT" "$UPDATE_CHECK" "$AUTO_UPDATE" "$REFRESH_SECS" > "$CONF"
     chmod 644 "$CONF"
-    echo "  ${GREEN}✔ Saved: ${MODE}${NC}"
+}
+
+screen_settings() {
+    local c cur
+    need_root || return 0
+    while true; do
+        printf '\e[2J\e[H'
+        echo
+        panel_top "Settings"
+        kv "Login screen" "${MODE}$( [ "$MODE" = "live" ] && echo " ${DIM}(stays open until q)${NC}" )"
+        kv "Update question" "$( [ "$UPDATE_PROMPT" = "1" ] && echo 'on - asks at login when updates are available' || echo 'off - the dashboard only shows them' )"
+        kv "Installer check" "$( [ "$UPDATE_CHECK" = "1" ] && echo 'on - looks once a day on GitHub for a newer version' || echo 'off - never contacts GitHub' )"
+        kv "Auto-install" "$( [ "$AUTO_UPDATE" = "1" ] && echo "${YELLOW}on - installs a newer installer by itself${NC}" || echo 'off - you decide (press i)' )"
+        kv "Live refresh" "every ${REFRESH_SECS} seconds"
+        panel_blank
+        panel_line "${DIM}Applies from the next login.${NC}"
+        panel_bottom
+        menu_select c 0 \
+            "Change the login screen|Dashboard only, dashboard + menu prompt, live dashboard, or off" \
+            "Turn the update question $( [ "$UPDATE_PROMPT" = "1" ] && echo off || echo on )|At login: offer to install available updates (u = install, s = snooze 24 h)" \
+            "Turn the installer check $( [ "$UPDATE_CHECK" = "1" ] && echo off || echo on )|One request a day to api.github.com to see if a newer version exists" \
+            "Turn auto-install $( [ "$AUTO_UPDATE" = "1" ] && echo off || echo on )|A newer installer is installed without asking (checked, saved and rolled back if it fails)" \
+            "Live refresh: ${REFRESH_SECS}s|Change how often the live dashboard redraws (2, 3, 5 or 10 seconds)" \
+            "Back"
+        case "$c" in
+            0)
+                cur=1
+                case "$MODE" in off) cur=3 ;; dashboard) cur=0 ;; live) cur=2 ;; esac
+                menu_select c "$cur" \
+                    "Dashboard only|Shows the dashboard at login, then your shell" \
+                    "Dashboard + menu prompt|After the dashboard: press m for the menu, h for help (${PROMPT_SECS}s, then the shell)" \
+                    "Live dashboard|Stays open and refreshes until you press q - with a key bar for menu, log, repair and updates" \
+                    "Off|No login screen - pbs-menu still works"
+                case "$c" in
+                    0) MODE=dashboard ;;
+                    1) MODE=prompt ;;
+                    2) MODE=live ;;
+                    3) MODE=off ;;
+                esac
+                save_conf
+                ;;
+            1) if [ "$UPDATE_PROMPT" = "1" ]; then UPDATE_PROMPT=0; else UPDATE_PROMPT=1; fi; save_conf ;;
+            2) if [ "$UPDATE_CHECK" = "1" ]; then UPDATE_CHECK=0; else UPDATE_CHECK=1; fi; save_conf ;;
+            3) if [ "$AUTO_UPDATE" = "1" ]; then AUTO_UPDATE=0; else
+                   AUTO_UPDATE=1; UPDATE_CHECK=1
+               fi
+               save_conf ;;
+            4) menu_select c 1 "2 seconds|Fast, a little more load" "3 seconds|Default" "5 seconds|Calmer" "10 seconds|Very calm"
+               case "$c" in 0) REFRESH_SECS=2 ;; 1) REFRESH_SECS=3 ;; 2) REFRESH_SECS=5 ;; 3) REFRESH_SECS=10 ;; esac
+               save_conf ;;
+            *) return 0 ;;
+        esac
+    done
 }
 
 menu_main() {
     local c=0 rc
     need_root || exit 1
     while true; do
+        load_release
         printf '\e[2J\e[H'
         render_dashboard_compact
         menu_select c "$c" \
@@ -3509,6 +4054,8 @@ menu_main() {
             "Check & repair now|Runs the monitor once - repairs a lost connection" \
             "Monitor log|The last events from the iSCSI monitor" \
             "Services|Status of PBS, iSCSI and cron - restart PBS" \
+            "System updates|Check for updates and install them - advises a reboot after kernel updates" \
+            "Installer update|Newer version of this installer / login screen on GitHub$( [ "$REL_NEW" -eq 1 ] && echo " - v${REL_LATEST} IS AVAILABLE" )" \
             "Help · key commands|The commands you will need" \
             "Settings|Choose what happens at login" \
             "Back to the shell"
@@ -3525,8 +4072,11 @@ menu_main() {
             4) screen_repair ;;
             5) screen_log 40 ;;
             6) screen_services; continue ;;
-            7) render_help ;;
-            8) screen_settings ;;
+            7) do_update ;;
+            8) installer_update
+               if [ "$UPDATED" -eq 1 ]; then press_key; exec /usr/local/sbin/pbs-motd --menu; fi ;;
+            9) render_help ;;
+            10) screen_settings; continue ;;
             *) break ;;
         esac
         press_key
@@ -3557,6 +4107,138 @@ render_dashboard_compact() {
             echo "  ${RED}●${NC} ${MOUNT_PATH}  ${RED}not connected or not mounted${NC}"
         fi
     done 3< <(mon_scripts)
+}
+
+# A small terminal (the Proxmox console is 80x25) cannot show everything at once. The panels are
+# split over pages instead of cutting the picture off: n / space / → = next page, b / ← = back.
+PAGE=0; PAGES=1
+PAGE_OUT=""
+paginate() {   # paginate "TEXT" MAXLINES -> sets PAGE_OUT (the page to draw) and PAGES; keeps PAGE in range
+    local text="$1" maxl="$2" i p L cur=0 avail np=0 hdr_end=-1
+    local -a lines=() pfirst=() plast=() pg_first=() pg_last=() sel=()
+    mapfile -t lines <<< "$text"
+    for (( i = 0; i < ${#lines[@]}; i++ )); do
+        case "${lines[i]}" in
+            *"╭─"*) pfirst[np]=$(( i > 0 ? i - 1 : 0 ))
+                    [ "$hdr_end" -lt 0 ] && hdr_end=${pfirst[np]} ;;
+            *"╰─"*) plast[np]=$i; np=$(( np + 1 )) ;;
+        esac
+    done
+    if [ "$np" -eq 0 ] || [ "$hdr_end" -lt 0 ]; then
+        PAGES=1; PAGE=0
+        printf -v PAGE_OUT '%s\n' "${lines[@]:0:maxl}"
+        return 0
+    fi
+    avail=$(( maxl - hdr_end ))
+    [ "$avail" -lt 6 ] && avail=6
+    PAGES=0
+    for (( p = 0; p < np; p++ )); do
+        L=$(( plast[p] - pfirst[p] + 1 ))
+        if [ "$cur" -gt 0 ] && [ $(( cur + L )) -gt "$avail" ]; then
+            pg_last[PAGES]=$(( p - 1 )); PAGES=$(( PAGES + 1 )); cur=0
+        fi
+        [ "$cur" -eq 0 ] && pg_first[PAGES]=$p
+        cur=$(( cur + L ))
+    done
+    pg_last[PAGES]=$(( np - 1 )); PAGES=$(( PAGES + 1 ))
+    [ "$PAGE" -ge "$PAGES" ] && PAGE=0
+    [ "$PAGE" -lt 0 ] && PAGE=$(( PAGES - 1 ))
+    sel=("${lines[@]:0:hdr_end}")
+    for (( p = pg_first[PAGE]; p <= pg_last[PAGE]; p++ )); do
+        sel+=("${lines[@]:pfirst[p]:plast[p]-pfirst[p]+1}")
+    done
+    printf -v PAGE_OUT '%s\n' "${sel[@]:0:maxl}"
+}
+
+# ---------------------------------------------------------------- live dashboard (login style "live")
+# The dashboard stays on screen and refreshes until you press q. A key bar at the bottom shows
+# what you can do; alerts (updates, reboot, new installer) appear there in sharp red.
+cockpit() {
+    local out k rc rest n rows maxl bar hint alerts last_rows=0
+    if ! [ -t 0 ] || ! [ -t 1 ]; then
+        render_dashboard; return 0
+    fi
+    SLIM=0
+    trap 'printf "\e[?25h"' EXIT
+    trap 'printf "\e[?25h\n"; exit 0' INT TERM
+    printf '\e[?25l\e[2J'
+    while true; do
+        COLS=$(term_cols)
+        rows=$(tput lines 2>/dev/null || echo 24)
+        case "$rows" in ''|*[!0-9]*) rows=24 ;; esac
+        [ "$rows" != "$last_rows" ] && { SLIM=0; last_rows=$rows; printf '\e[2J'; }
+        # the state that decides the key bar (the dashboard itself is drawn in a subshell)
+        load_updates; reboot_info; load_release
+        sample_io
+        alerts=""
+        [ "${UPD_N:-0}" -gt 0 ] && alerts="${alerts} ${ALERT} u ${NC} ${WHITE}update (${UPD_N})${NC}  "
+        [ "$REL_NEW" -eq 1 ] && alerts="${alerts} ${ALERT} i ${NC} ${WHITE}installer v${REL_LATEST}${NC}  "
+        [ "$REBOOT_NEEDED" -eq 1 ] && alerts="${alerts} ${ALERT} r ${NC} ${WHITE}reboot${NC}"
+        maxl=$(( rows - 3 ))
+        [ -n "$alerts" ] && maxl=$(( maxl - 1 ))
+        out=$(render_dashboard 2>&1)
+        n=$(wc -l <<< "$out")
+        if [ "$n" -gt "$maxl" ] && [ "$SLIM" -eq 0 ]; then
+            SLIM=1
+            out=$(render_dashboard 2>&1)
+            n=$(wc -l <<< "$out")
+        fi
+        if [ "$n" -gt "$maxl" ]; then
+            paginate "$out" "$maxl"
+            out=${PAGE_OUT%$'\n'}
+        else
+            PAGES=1; PAGE=0
+        fi
+        bar=" ${CYAN}m${NC} menu  ${CYAN}l${NC} log  ${CYAN}c${NC} repair  ${CYAN}h${NC} help"
+        [ "$PAGES" -gt 1 ] && bar="${bar}  ${CYAN}n${NC} page"
+        bar="${bar}  ${CYAN}p${NC} all  ${CYAN}q${NC} shell"
+        [ -n "$alerts" ] && bar="${alerts}"$'\e[K\n'"${bar}"
+        hint="${DIM}live · every ${REFRESH_SECS}s · $(date '+%H:%M:%S')"
+        [ "$PAGES" -gt 1 ] && hint="${hint} · page $(( PAGE + 1 ))/${PAGES}"
+        printf '\e[H%s\n' "$(sed 's/$/\x1b[K/' <<< "$out")"
+        printf '\e[K\n%s\e[K\n  %s%s\e[K\e[J' "$bar" "$hint" "$NC"
+        k=""
+        IFS= read -rsn1 -t "$REFRESH_SECS" k
+        rc=$?
+        [ "$rc" -gt 128 ] && continue           # timeout: just redraw
+        if [ "$k" = $'\e' ]; then
+            rest=""
+            IFS= read -rsn2 -t 0.05 rest || true
+            case "$rest" in
+                '[C'|'OC') k="n" ;;            # → next page
+                '[D'|'OD') k="b" ;;            # ← previous page
+                '')        ;;                  # a bare Esc leaves
+                *)         k="arrow" ;;        # other escape sequences are ignored
+            esac
+        fi
+        case "$k" in
+            q|Q|$'\e'|"") break ;;               # q, Esc or Enter: back to the shell
+            n|N|" "|$'\t') [ "$PAGES" -gt 1 ] && PAGE=$(( (PAGE + 1) % PAGES )); printf '\e[2J' ;;
+            b|B) [ "$PAGES" -gt 1 ] && PAGE=$(( (PAGE + PAGES - 1) % PAGES )); printf '\e[2J' ;;
+            m|M) printf '\e[?25h\e[2J\e[H'; menu_main; printf '\e[?25l\e[2J' ;;
+            l|L) printf '\e[?25h\e[2J\e[H'; screen_log 40; press_key; printf '\e[?25l\e[2J' ;;
+            c|C) printf '\e[?25h\e[2J\e[H'; screen_repair; press_key; printf '\e[?25l\e[2J' ;;
+            h|H) printf '\e[?25h\e[2J\e[H'; render_help; press_key; printf '\e[?25l\e[2J' ;;
+            p|P) printf '\e[?25h\e[2J\e[H'; SLIM=0 render_dashboard 2>&1 | less -R; printf '\e[?25l\e[2J' ;;
+            u|U) if [ "${UPD_N:-0}" -gt 0 ]; then
+                     printf '\e[?25h\e[2J\e[H'; do_update; press_key; printf '\e[?25l\e[2J'
+                 fi ;;
+            i|I) if [ "$REL_NEW" -eq 1 ]; then
+                     printf '\e[?25h\e[2J\e[H'
+                     installer_update
+                     press_key
+                     [ "$UPDATED" -eq 1 ] && exec /usr/local/sbin/pbs-motd --live
+                     printf '\e[?25l\e[2J'
+                 fi ;;
+            r|R) if [ "$REBOOT_NEEDED" -eq 1 ]; then
+                     printf '\e[?25h\e[2J\e[H'; do_reboot; press_key; printf '\e[?25l\e[2J'
+                 fi ;;
+        esac
+    done
+    printf '\e[?25h\n'
+    echo "  ${DIM}Live dashboard closed.  pbs-motd --live  opens it again · pbs-menu  menu${NC}"
+    echo
+    trap - INT TERM EXIT
 }
 
 # ---------------------------------------------------------------- login
@@ -3597,30 +4279,59 @@ wait_for_storage() {
 }
 
 do_login() {
-    local k
+    local k want_upd=0 want_rel=0 secs parts is_root=0
     [ "$MODE" = "off" ] && return 0
+    [ "$(id -u)" -eq 0 ] && is_root=1
     wait_for_storage
+    if [ "$MODE" = "live" ] && [ "$is_root" -eq 1 ] && [ -t 0 ] && [ -t 1 ]; then
+        cockpit
+        return 0
+    fi
     render_dashboard
     panel_keys
     echo
-    if [ "$MODE" = "prompt" ]; then
-        printf '  %sPress%s %sm%s %sfor the menu ·%s %sh%s %sfor help · or wait %ss%s ' \
-            "$DIM" "$NC" "$CYAN" "$NC" "$DIM" "$NC" "$CYAN" "$NC" "$DIM" "$PROMPT_SECS" "$NC"
+    if [ "$is_root" -eq 1 ] && [ "$UPDATE_PROMPT" = "1" ] && ! snoozed; then
+        [ "${UPD_N:-0}" -gt 0 ] && want_upd=1
+        [ "$REL_NEW" -eq 1 ] && want_rel=1
+    fi
+    if [ "$MODE" = "prompt" ] || [ "$want_upd" -eq 1 ] || [ "$want_rel" -eq 1 ] \
+        || { [ "$REBOOT_NEEDED" -eq 1 ] && [ "$is_root" -eq 1 ]; }; then
+        secs="$PROMPT_SECS"
+        parts=""
+        if [ "$want_upd" -eq 1 ]; then
+            parts="${parts}${ALERT} u ${NC} ${WHITE}install the ${UPD_N} update(s)${NC}   "
+        fi
+        if [ "$want_rel" -eq 1 ]; then
+            parts="${parts}${ALERT} i ${NC} ${WHITE}installer v${REL_LATEST}${NC}   "
+        fi
+        if [ "$REBOOT_NEEDED" -eq 1 ] && [ "$is_root" -eq 1 ]; then
+            parts="${parts}${ALERT} r ${NC} ${WHITE}reboot${NC}   "
+        fi
+        if [ -n "$parts" ]; then
+            [ "$secs" -lt 10 ] && secs=10
+            [ "$want_upd" -eq 1 ] || [ "$want_rel" -eq 1 ] && parts="${parts}${CYAN}s${NC} ${DIM}snooze 24h${NC}"
+            echo "  ${parts}"
+        fi
+        printf '  %sm%s %smenu ·%s %sh%s %shelp · or wait %ss%s ' "$CYAN" "$NC" "$DIM" "$NC" "$CYAN" "$NC" "$DIM" "$secs" "$NC"
         k=""
-        IFS= read -rsn1 -t "$PROMPT_SECS" k
+        IFS= read -rsn1 -t "$secs" k
         printf '\r\e[K'
         case "$k" in
-            m|M) [ "$(id -u)" -eq 0 ] && menu_main ;;
+            u|U) [ "$want_upd" -eq 1 ] && do_update ;;
+            i|I) if [ "$want_rel" -eq 1 ]; then
+                     installer_update
+                     [ "$UPDATED" -eq 1 ] && exec /usr/local/sbin/pbs-motd --login
+                 fi ;;
+            s|S) if [ "$want_upd" -eq 1 ] || [ "$want_rel" -eq 1 ]; then
+                     mkdir -p "$(dirname "$SNOOZE_FILE")"
+                     echo $(( $(date +%s) + 86400 )) > "$SNOOZE_FILE"
+                     echo "  ${DIM}No update question for 24 hours. The dashboard still shows them.${NC}"
+                 fi ;;
+            r|R) [ "$REBOOT_NEEDED" -eq 1 ] && [ "$is_root" -eq 1 ] && do_reboot ;;
+            m|M) [ "$is_root" -eq 1 ] && menu_main ;;
             h|H) render_help ;;
         esac
     fi
-}
-
-refresh_updates() {
-    local n
-    mkdir -p "$(dirname "$UPD_FILE")"
-    n=$(apt-get -s dist-upgrade 2>/dev/null | grep -c '^Inst ' || true)
-    echo "${n:-0}|$(date +%s)" > "$UPD_FILE"
 }
 
 case "$(basename "$0")" in
@@ -3631,27 +4342,38 @@ esac
 case "${1:-}" in
     "")        render_dashboard; panel_keys; echo ;;
     --login)   do_login ;;
+    --live)    need_root || exit 1; cockpit ;;
     --watch)   screen_watch ;;
+    --check-release) run_check_release ;;
+    --update-installer) installer_update ;;
+    --rollback) do_rollback ;;
     --menu)    menu_main ;;
     --help|-h) render_help ;;
     --refresh-updates) refresh_updates ;;
     --version) echo "pbs-motd v${PBS_MOTD_VERSION:-?}" ;;
-    *)         echo "Usage: pbs-motd [--login|--watch|--menu|--help]" >&2; exit 2 ;;
+    *)         echo "Usage: pbs-motd [--login|--live|--watch|--menu|--help|--update-installer|--rollback]" >&2; exit 2 ;;
 esac
 exit 0
 MOTD_EOF
-    } > "$dest"
+    } > "${dest}.new" && mv -f "${dest}.new" "$dest"
 }
 
 # Copies this installer to /usr/local/sbin (so --status / --fix-login work from anywhere)
 install_self_copy() {
     if [[ -f "$0" ]]; then
-        if [[ "$0" -ef /usr/local/sbin/pbs-post-install.sh ]] || cp "$0" /usr/local/sbin/pbs-post-install.sh 2>/dev/null; then
+        # copy + rename: a copy of the installer that is running right now is never rewritten in place
+        if [[ "$0" -ef /usr/local/sbin/pbs-post-install.sh ]] \
+            || { cp "$0" /usr/local/sbin/pbs-post-install.sh.new 2>/dev/null \
+                 && mv -f /usr/local/sbin/pbs-post-install.sh.new /usr/local/sbin/pbs-post-install.sh; }; then
             chmod 755 /usr/local/sbin/pbs-post-install.sh
             return 0
         fi
     fi
     [[ -x /usr/local/sbin/pbs-post-install.sh ]]
+}
+
+motd_conf_val() {   # motd_conf_val KEY -> value from /etc/pbs-motd.conf (empty when absent)
+    sed -n "s/^$1=//p" /etc/pbs-motd.conf 2>/dev/null | head -n 1
 }
 
 install_motd_files() {
@@ -3661,8 +4383,22 @@ install_motd_files() {
     ln -sf /usr/local/sbin/pbs-motd /usr/local/bin/pbs-menu
     ln -sf /usr/local/sbin/pbs-motd /usr/local/bin/pbs-help
     ln -sf /usr/local/sbin/pbs-motd /usr/local/bin/pbs-motd
-    printf 'MODE=%s\nPROMPT_SECS=5\n' "$MOTD_MODE" > /etc/pbs-motd.conf
+    local mode="$MOTD_MODE" m up pr chk auto ref
+    up=$(motd_conf_val UPDATE_PROMPT); pr=$(motd_conf_val PROMPT_SECS)
+    chk=$(motd_conf_val UPDATE_CHECK); auto=$(motd_conf_val AUTO_UPDATE); ref=$(motd_conf_val REFRESH_SECS)
+    if [[ ${MOTD_KEEP_CONF:-0} -eq 1 ]]; then
+        m=$(motd_conf_val MODE)
+        [[ -n "$m" ]] && mode="$m"
+    fi
+    printf 'MODE=%s\nPROMPT_SECS=%s\nUPDATE_PROMPT=%s\nUPDATE_CHECK=%s\nAUTO_UPDATE=%s\nREFRESH_SECS=%s\n' \
+        "$mode" "${pr:-5}" "${up:-1}" "${chk:-1}" "${auto:-0}" "${ref:-3}" > /etc/pbs-motd.conf
     chmod 644 /etc/pbs-motd.conf
+    # Refresh the "updates available" count right after apt update / dpkg runs
+    cat > /etc/apt/apt.conf.d/99pbs-motd <<'APTHOOK_EOF'
+// Written by pbs-post-install: keep the login screen's update count current
+DPkg::Post-Invoke { "sh -c '(sleep 3; /usr/local/sbin/pbs-motd --refresh-updates) >/dev/null 2>&1 &'"; };
+APT::Update::Post-Invoke-Success { "sh -c '(sleep 3; /usr/local/sbin/pbs-motd --refresh-updates) >/dev/null 2>&1 &'"; };
+APTHOOK_EOF
     cat > /etc/profile.d/pbs-motd.sh <<'PROFILE_EOF'
 # Login dashboard for Proxmox Backup Server (written by pbs-post-install).
 # Remove with:  pbs-post-install.sh --motd-remove     Turn off: MODE=off in /etc/pbs-motd.conf
@@ -3684,7 +4420,10 @@ PROFILE_EOF
     cat > /etc/cron.d/pbs-motd <<'CRON_EOF'
 # Written by pbs-post-install: refresh the "updates available" count for the login screen
 17 6 * * * root /usr/local/sbin/pbs-motd --refresh-updates >/dev/null 2>&1
+# Once a day: is there a newer version of this installer on GitHub? (Settings: installer check)
+@@CHECK@@ 7 * * * root /usr/local/sbin/pbs-motd --check-release >/dev/null 2>&1
 CRON_EOF
+    sed -i "s/@@CHECK@@/$(( RANDOM % 50 + 5 ))/" /etc/cron.d/pbs-motd
     chmod 644 /etc/cron.d/pbs-motd
     /usr/local/sbin/pbs-motd --refresh-updates >/dev/null 2>&1 || true
 }
@@ -3701,7 +4440,7 @@ step_motd() {
     if install_self_copy; then
         SELF_CMD="pbs-post-install.sh --status"
     fi
-    finish_step $S_MOTD "$( [[ "$MOTD_MODE" == "prompt" ]] && echo 'dashboard + menu prompt' || echo 'dashboard' ) at login"
+    finish_step $S_MOTD "$( case "$MOTD_MODE" in prompt) echo 'dashboard + menu prompt' ;; live) echo 'live dashboard' ;; *) echo 'dashboard' ;; esac ) at login"
 }
 
 # --motd : install or update only the login screen
@@ -3717,6 +4456,8 @@ run_motd_only() {
         render_banner
         DO_MOTD=1
         setup_motd
+    else
+        MOTD_KEEP_CONF=1
     fi
     install_motd_files
     install_self_copy || true
@@ -3726,14 +4467,28 @@ run_motd_only() {
     echo
 }
 
+# --motd-update : silent update of the login screen + installer copy, keeps all settings.
+# Used by "pbs-motd --update-installer" (the one-key update) and the optional auto-install.
+run_motd_update() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "--motd-update needs root." >&2
+        return 2
+    fi
+    MOTD_KEEP_CONF=1
+    install_motd_files
+    install_self_copy
+    echo "pbs-post-install v${VERSION}: login screen and installer updated."
+}
+
 run_motd_remove() {
     if [[ $EUID -ne 0 ]]; then
         echo "--motd-remove needs root. Run:  sudo $0 --motd-remove" >&2
         return 2
     fi
-    rm -f /etc/profile.d/pbs-motd.sh /etc/cron.d/pbs-motd /etc/pbs-motd.conf \
+    rm -f /etc/profile.d/pbs-motd.sh /etc/cron.d/pbs-motd /etc/pbs-motd.conf /etc/apt/apt.conf.d/99pbs-motd \
           /usr/local/bin/pbs-menu /usr/local/bin/pbs-help /usr/local/bin/pbs-motd /usr/local/sbin/pbs-motd
     rm -rf /var/lib/pbs-motd
+    rm -f /var/log/pbs-motd-update.log /var/lock/pbs-motd-update.lock
     if [[ -f /etc/motd.pbs-orig ]]; then
         mv /etc/motd.pbs-orig /etc/motd
     fi
@@ -4386,6 +5141,8 @@ PBS Post-Install v${VERSION}
                                      target (Synology log: "CHAP required but absent")
   ./pbs-post-install.sh --motd       install / update only the login dashboard + menu
   ./pbs-post-install.sh --motd-remove  remove the login screen (restores /etc/motd)
+  ./pbs-post-install.sh --motd-update  update login screen + installer copy, keep all settings
+                                     (normally started for you by: pbs-motd --update-installer)
   ./pbs-post-install.sh --version
   ./pbs-post-install.sh --help
 EOF
@@ -4412,6 +5169,10 @@ main() {
             ;;
         --motd-remove)
             run_motd_remove || rc=$?
+            exit "$rc"
+            ;;
+        --motd-update)
+            run_motd_update || rc=$?
             exit "$rc"
             ;;
         --version|-V)
