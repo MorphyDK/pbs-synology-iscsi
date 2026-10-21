@@ -1,21 +1,14 @@
 <div align="center">
 
-```
- ██████╗ ██████╗ ███████╗
- ██╔══██╗██╔══██╗██╔════╝
- ██████╔╝██████╔╝███████╗
- ██╔═══╝ ██╔══██╗╚════██║
- ██║     ██████╔╝███████║
- ╚═╝     ╚═════╝ ╚══════╝
-```
+<img src="social-preview.png" alt="Proxmox Backup Server Synology iSCSI post-install: CHAP, self-healing mount, live login dashboard, one-key self-update" width="100%">
 
-# PBS Post-Install
+# Proxmox Backup Server · Synology iSCSI Post-Install
 
-**A guided post-install for Proxmox Backup Server: a stable datastore on a Synology iSCSI LUN, a self-healing connection, and a login screen that shows you the state of everything.**
+**A guided post-install script for Proxmox Backup Server (PBS): a stable datastore on a Synology iSCSI LUN with CHAP, a self-healing connection, and a login screen that shows you the state of everything.**
 
-*Plain shell menus · CHAP · ext4 or XFS · keeps your data · repairs itself · live login dashboard*
+*Plain shell menus · CHAP · ext4 or XFS · keeps your data · repairs itself · live login dashboard · one-key self-update*
 
-![version](https://img.shields.io/badge/version-1.9.1-2f81f7?style=for-the-badge)
+![version](https://img.shields.io/badge/version-1.9.2-2f81f7?style=for-the-badge)
 ![debian](https://img.shields.io/badge/Debian-13%20trixie-d70a53?style=for-the-badge&logo=debian&logoColor=white)
 ![pbs](https://img.shields.io/badge/Proxmox%20Backup%20Server-4.x-e57000?style=for-the-badge)
 ![bash](https://img.shields.io/badge/Bash-5.x-4eaa25?style=for-the-badge&logo=gnubash&logoColor=white)
@@ -79,7 +72,7 @@ This script walks you through the whole setup with questions first and changes s
 - **Self-update**: once a day the login screen looks on GitHub for a newer release. If there is one, a sharp red "NEW VERSION" line appears. Press `i` and it downloads, checks, saves the old version, installs and tests the new one, and **puts the old one back by itself if anything fails**. Only the login screen and the script are replaced, never your iSCSI, mount or datastore. See [Updating the installer](#updating-the-installer).
 - **Live dashboard** (optional login style): stays open and refreshes until you press `q`, with a key bar for menu, log, repair, updates and reboot. On a small console it splits into pages.
 - **Live traffic graph**: reads and writes per second as a small graph, plus the average latency to the NAS, in the live views.
-- **Interactive menu** (`pbs-menu`): live view, LUN details, storage, health check, check and repair now, logs, services, system updates, installer update, help, settings.
+- **Interactive menu** (`pbs-menu`): the logo and status stay **frozen at the top** while the menus scroll below. **Drive cards** show every LUN with a small drive icon, thin/thick, filesystem, a usage bar and its connection. The items are grouped, with **badges** for what needs attention (updates, new installer, PBS stopped, a drive with a problem).
 - **`--status`** health check you can also run from cron (exit codes 0 / 1 / 2).
 - **`--fix-login`** to type the CHAP login again for an installed target.
 
@@ -99,7 +92,7 @@ This script walks you through the whole setup with questions first and changes s
    ██████╔╝██████╔╝███████╗   Proxmox Backup Server  4.2.8
    ██╔═══╝ ██╔══██╗╚════██║   iSCSI storage on Synology
    ██║     ██████╔╝███████║   ● ALL SYSTEMS HEALTHY
-   ╚═╝     ╚═════╝ ╚══════╝   pbs-motd v1.9.1 · by MorphyDK
+   ╚═╝     ╚═════╝ ╚══════╝   pbs-motd v1.9.2 · by MorphyDK
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   ╭─ Server
@@ -109,7 +102,7 @@ This script walks you through the whole setup with questions first and changes s
   │ System disk    ████░░░░░░░░░░░░░░░░░░░░  17%  4.8GB of 28GB
   │ Updates        ✔ up to date (checked 5h ago)
   │ Reboot         (shown in red when a newer kernel is installed than the one running)
-  │ Installer      ✔ v1.9.1 · newest version (checked 3h ago)
+  │ Installer      ✔ v1.9.2 · newest version (checked 3h ago)
   ╰─
 
   ╭─ iSCSI storage · /mnt/synology
@@ -295,19 +288,35 @@ In the **live dashboard** a key bar at the bottom shows what you can do: `m` men
 | `pbs-menu` | Interactive menu (or press `m` at login) |
 | `pbs-help` | The key commands for iSCSI, storage and PBS (or press `h` at login) |
 
-**The menu**
+**The menu** (`pbs-menu`, or press `m` at login)
 
-1. Live view
-2. LUN & connection (target, login, session details, disks, and re-enter the CHAP login)
-3. Storage & datastore
-4. Health check (the full `--status`)
-5. Check & repair now
-6. Monitor log
-7. Services (status, restart PBS)
-8. System updates (check, install, reboot advice)
-9. Installer update (newer version of this installer on GitHub)
-10. Help · key commands
-11. Settings (login style, update question, installer check, auto-install, refresh speed)
+```
+   ██████╗ ██████╗ ███████╗   pbs  192.168.0.57
+   ██╔══██╗██╔══██╗██╔════╝   Proxmox Backup Server  4.2.8
+   ██████╔╝██████╔╝███████╗   ● ALL SYSTEMS HEALTHY
+   ╚═╝     ╚═════╝ ╚══════╝   pbs-motd v1.9.2 · by MorphyDK
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ▄▄▄  synology-Thick  thick · ext4 · 20GB   ● connected
+  █●█  █░░░░░░░░░░░░░░░░░░░░░░░░░░░   1%  20GB free
+  ▄▄▄  synology-Thin   thin · xfs · 20GB     ● connected
+  █●█  █░░░░░░░░░░░░░░░░░░░░░░░░░░░   2%  20GB free
+
+  WATCH     1 Live view      2 LUN & connection   3 Storage
+  CHECK     4 Health check   5 Check & repair     6 Monitor log
+  SYSTEM    7 Services       8 System updates [3] 9 Installer [NEW]
+  OTHER     0 Help           s Settings           q Back to shell
+```
+
+Move with the arrow keys and press Enter, or press the number or letter of an item. The header stays where it is: logos, status pill and the drive cards are redrawn after every action, and everything you open scrolls underneath. On a small terminal (the Proxmox console is 80x25) the header shrinks to one line so the menu still fits.
+
+| Group | Items |
+|---|---|
+| **Watch** | 1 Live view · 2 LUN & connection (target, login, session details, disks, re-enter the CHAP login) · 3 Storage & datastore |
+| **Check** | 4 Health check (the full `--status`) · 5 Check & repair now · 6 Monitor log |
+| **System** | 7 Services (status, restart PBS) · 8 System updates (check, install, reboot advice) · 9 Installer update |
+| **Other** | 0 Help · key commands · s Settings (login style, update question, installer check, auto-install, refresh speed) · q Back to the shell |
+
+Badges next to an item: red `[!]` on *LUN & connection* and *Check & repair* when a drive has a problem, on *Services* when PBS is not running; `[3]` or `[reboot]` on *System updates*; `[NEW]` on *Installer*.
 
 It only runs for **root** in an interactive terminal. `scp`, `rsync` and scripts are never affected. The original `/etc/motd` is saved as `/etc/motd.pbs-orig`. Turn the screen off with `MODE=off` in `/etc/pbs-motd.conf`, or remove it with `--motd-remove`.
 
@@ -523,7 +532,7 @@ The datastore itself is removed in the PBS web UI (Datastore › Remove). That d
 
 **Not yet verified on real hardware:** what happens through a full DSM update/reboot with a backup running, the automatic repair after a long outage, and XFS on very large LUNs. **Please test restores before you rely on any backup setup**, and open an issue if something behaves differently on your system.
 
-The script has not been linted with `shellcheck` yet.
+Checked with `shellcheck` (the installer, the generated login screen and the monitor script): no errors. The few remaining notes were tidied in v1.9.2.
 
 ---
 
