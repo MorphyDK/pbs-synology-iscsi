@@ -8,7 +8,7 @@
 
 *Plain shell menus · CHAP · ext4 or XFS · keeps your data · repairs itself · live login dashboard · one-key self-update*
 
-![version](https://img.shields.io/badge/version-1.9.3-2f81f7?style=for-the-badge)
+![version](https://img.shields.io/badge/version-1.10.0-2f81f7?style=for-the-badge)
 ![debian](https://img.shields.io/badge/Debian-13%20trixie-d70a53?style=for-the-badge&logo=debian&logoColor=white)
 ![pbs](https://img.shields.io/badge/Proxmox%20Backup%20Server-4.x-e57000?style=for-the-badge)
 ![bash](https://img.shields.io/badge/Bash-5.x-4eaa25?style=for-the-badge&logo=gnubash&logoColor=white)
@@ -75,6 +75,7 @@ This script walks you through the whole setup with questions first and changes s
 - **Interactive menu** (`pbs-menu`): the logo and status stay **frozen at the top** while the menus scroll below. **Drive cards** show every LUN with a small drive icon, thin/thick, filesystem, a usage bar and its connection. The items are grouped, with **badges** for what needs attention (updates, new installer, PBS stopped, a drive with a problem).
 - **`--status`** health check you can also run from cron (exit codes 0 / 1 / 2).
 - **`--fix-login`** to type the CHAP login again for an installed target.
+- **Drives menu**: see the details of every drive, **add another LUN**, or **remove a drive** again (datastore, monitor, mount and iSCSI login) in the safe order. See [Drives: add and remove](#drives-add-and-remove).
 
 ### The rest of a post-install
 
@@ -92,7 +93,7 @@ This script walks you through the whole setup with questions first and changes s
    ██████╔╝██████╔╝███████╗   Proxmox Backup Server  4.2.8
    ██╔═══╝ ██╔══██╗╚════██║   iSCSI storage on Synology
    ██║     ██████╔╝███████║   ● ALL SYSTEMS HEALTHY
-   ╚═╝     ╚═════╝ ╚══════╝   pbs-motd v1.9.3 · by MorphyDK
+   ╚═╝     ╚═════╝ ╚══════╝   pbs-motd v1.10.0 · by MorphyDK
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   ╭─ Server
@@ -102,7 +103,7 @@ This script walks you through the whole setup with questions first and changes s
   │ System disk    ████░░░░░░░░░░░░░░░░░░░░  17%  4.8GB of 28GB
   │ Updates        ✔ up to date (checked 5h ago)
   │ Reboot         (shown in red when a newer kernel is installed than the one running)
-  │ Installer      ✔ v1.9.3 · newest version (checked 3h ago)
+  │ Installer      ✔ v1.10.0 · newest version (checked 3h ago)
   ╰─
 
   ╭─ iSCSI storage · /mnt/synology
@@ -294,31 +295,59 @@ In the **live dashboard** a key bar at the bottom shows what you can do: `m` men
    ██████╗ ██████╗ ███████╗   pbs  192.168.0.57
    ██╔══██╗██╔══██╗██╔════╝   Proxmox Backup Server  4.2.8
    ██████╔╝██████╔╝███████╗   ● ALL SYSTEMS HEALTHY
-   ╚═╝     ╚═════╝ ╚══════╝   pbs-motd v1.9.3 · by MorphyDK
+   ╚═╝     ╚═════╝ ╚══════╝   pbs-motd v1.10.0 · by MorphyDK
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   ▄▄▄  synology-Thick  thick · ext4 · 20GB   ● connected
   █●█  █░░░░░░░░░░░░░░░░░░░░░░░░░░░   1%  20GB free
   ▄▄▄  synology-Thin   thin · xfs · 20GB     ● connected
   █●█  █░░░░░░░░░░░░░░░░░░░░░░░░░░░   2%  20GB free
 
-  WATCH     1 Live view      2 LUN & connection   3 Storage
+  WATCH     1 Live view      2 Drives             3 Storage
   CHECK     4 Health check   5 Check & repair     6 Monitor log
   SYSTEM    7 Services       8 System updates [3] 9 Installer [NEW]
   OTHER     0 Help           s Settings           q Back to shell
 ```
 
-Move with the arrow keys and press Enter, or press the number or letter of an item. The header stays where it is: logos, status pill and the drive cards are redrawn after every action, and everything you open scrolls underneath. On a small terminal (the Proxmox console is 80x25) the header shrinks to one line so the menu still fits. A screen that is longer than the space below the header (for example *LUN & connection* with several drives, or the health check) is shown **page by page**: space or ↓ for the next page, `b` or ↑ to go back, `q` when done.
+Move with the arrow keys and press Enter, or press the number or letter of an item. The header stays where it is: logos, status pill and the drive cards are redrawn after every action, and everything you open scrolls underneath. On a small terminal (the Proxmox console is 80x25) the header shrinks to one line so the menu still fits. A screen that is longer than the space below the header (for example *Drive details* with several drives, or the health check) is shown **page by page**: space or ↓ for the next page, `b` or ↑ to go back, `q` when done.
 
 | Group | Items |
 |---|---|
-| **Watch** | 1 Live view · 2 LUN & connection (target, login, session details, disks, re-enter the CHAP login) · 3 Storage & datastore |
+| **Watch** | 1 Live view · 2 Drives ([submenu](#drives-add-and-remove)) · 3 Storage & datastore |
 | **Check** | 4 Health check (the full `--status`) · 5 Check & repair now · 6 Monitor log |
 | **System** | 7 Services (status, restart PBS) · 8 System updates (check, install, reboot advice) · 9 Installer update |
 | **Other** | 0 Help · key commands · s Settings (login style, update question, installer check, auto-install, refresh speed) · q Back to the shell |
 
-Badges next to an item: red `[!]` on *LUN & connection* and *Check & repair* when a drive has a problem, on *Services* when PBS is not running; `[3]` or `[reboot]` on *System updates*; `[NEW]` on *Installer*.
+Badges next to an item: red `[!]` on *Drives* and *Check & repair* when a drive has a problem, on *Services* when PBS is not running; `[3]` or `[reboot]` on *System updates*; `[NEW]` on *Installer*.
 
 It only runs for **root** in an interactive terminal. `scp`, `rsync` and scripts are never affected. The original `/etc/motd` is saved as `/etc/motd.pbs-orig`. Turn the screen off with `MODE=off` in `/etc/pbs-motd.conf`, or remove it with `--motd-remove`.
+
+---
+
+## Drives: add and remove
+
+Menu item **2 Drives** (or `pbs-menu`, then `2`) opens a small submenu:
+
+| Entry | What it does |
+|---|---|
+| **Drive details** | Target, login, session details and disks of every drive. Read-only |
+| **Add a drive** | Connects one more Synology LUN: its own mount path, datastore and monitor. Only the drive questions are asked (no repository, upgrade or popup). Same as `pbs-post-install.sh --add-drive` |
+| **Change the CHAP login** | Type the username/password again. Same as `--fix-login` |
+| **Remove a drive** | Takes a drive away again. Same as `pbs-post-install.sh --remove-drive` |
+
+**Add a drive** suggests `/mnt/synology2` and `synology-backup-2` for the second drive. Use **one iSCSI target per LUN** on the Synology if you can: it keeps each drive independent when one has to be repaired.
+
+**Remove a drive** shows exactly what it will do, and only continues when you type the drive name. In this order:
+
+1. Refuses if a backup, verify, garbage-collection or sync task is running on the datastore.
+2. Removes the datastore from PBS. **The backup files stay on the LUN.**
+3. Stops the monitor (cron job) so it cannot "repair" the drive you are removing.
+4. Unmounts the drive. If it is busy, it shows what uses it and offers to stop PBS for a moment.
+5. Removes the `/etc/fstab` line (a copy is kept as `/etc/fstab.backup.<date>`), the empty mount directory and the boot-order file.
+6. Logs out of the iSCSI target and deletes its saved settings, **unless another drive uses the same target**.
+
+It never erases data on the LUN and never changes anything on the Synology. Afterwards, remove the storage entry in Proxmox VE (Datacenter › Storage) and check your backup jobs. If you want the space back, delete the LUN on the Synology yourself (SAN Manager › LUN). That deletes the backups on it for good.
+
+If something stops the removal halfway (for example a drive that stays busy), it tells you what was already done. The monitor is put back, and you can run *Remove a drive* again.
 
 ---
 
@@ -348,6 +377,8 @@ The file is downloaded over HTTPS from this repository's release tag. You trust 
 ./pbs-post-install.sh                 interactive installer
 ./pbs-post-install.sh --status        health dashboard, changes nothing
 ./pbs-post-install.sh --fix-login     type the CHAP username/password again
+./pbs-post-install.sh --add-drive     connect one more Synology LUN
+./pbs-post-install.sh --remove-drive  remove a drive (datastore, monitor, mount, iSCSI login)
 ./pbs-post-install.sh --motd          install or update only the login screen
 ./pbs-post-install.sh --motd-remove   remove the login screen
 ./pbs-post-install.sh --motd-update   update login screen + script, keep all settings
@@ -520,6 +551,8 @@ iscsiadm -m node -T <target-iqn> -p <portal> --logout
 iscsiadm -m node -T <target-iqn> -p <portal> -o delete
 ```
 
+The easy way for one drive: `pbs-menu` › **2 Drives** › **Remove a drive** (or `pbs-post-install.sh --remove-drive`), see [Drives: add and remove](#drives-add-and-remove). The manual steps above are what it does for you.
+
 The datastore itself is removed in the PBS web UI (Datastore › Remove). That does not delete the backups on the LUN.
 
 ---
@@ -529,6 +562,8 @@ The datastore itself is removed in the PBS web UI (Datastore › Remove). That d
 **Developed and run against:** Proxmox Backup Server 4.2.x on Debian 13 (trixie), a Synology NAS over iSCSI with CHAP, one thin and one thick LUN (ext4), with TRIM and the login dashboard on two drives.
 
 **Tested with a simulated GitHub:** the update (download, check, save, install, test), the automatic rollback when the new version fails, a file with the wrong version or a syntax error (refused), no network, auto-install, and `--rollback`. **Not yet run against the real GitHub release page**, so the first real update is the real test.
+
+**Drives menu (v1.10.0):** *Remove a drive* was run against simulated tools: a normal removal, a running task (refused), PBS refusing the datastore removal, a drive that is busy, and two drives on one target. *Add a drive* reuses the installer's tested setup. **Neither has been run against a real Synology yet**, so try *Remove a drive* first on a drive you can afford to lose.
 
 **Not yet verified on real hardware:** what happens through a full DSM update/reboot with a backup running, the automatic repair after a long outage, and XFS on very large LUNs. **Please test restores before you rely on any backup setup**, and open an issue if something behaves differently on your system.
 
@@ -540,7 +575,7 @@ Checked with `shellcheck` (the installer, the generated login screen and the mon
 
 - Backblaze B2 as a remote datastore (PBS S3 datastores, tech preview)
 - Datastore prune and garbage-collection presets
-- `--uninstall` and `--dry-run`
+- `--uninstall` (remove everything this script added) and `--dry-run`
 
 ---
 

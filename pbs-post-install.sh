@@ -7,16 +7,32 @@
 # 
 # Thanks to Derek Seaman's Tech Blog who inspired me to make this.
 #
-# Version 1.9.3  21/10-2026
+# Version 1.10.0  21/10-2026
 # Author MorphyDK
 #
 # Usage:  ./pbs-post-install.sh              interactive installer
 #         ./pbs-post-install.sh --status     health dashboard (no changes)
 #         ./pbs-post-install.sh --fix-login  re-enter the CHAP login of an installed target
+#         ./pbs-post-install.sh --add-drive  connect one more Synology LUN
+#         ./pbs-post-install.sh --remove-drive  take a drive away again
 #         ./pbs-post-install.sh --motd       install / update only the login screen
 #         ./pbs-post-install.sh --motd-remove  remove the login screen again
 #         ./pbs-post-install.sh --motd-update  silent update of the login screen, keeps settings
 #         ./pbs-post-install.sh --help
+#
+# Changes in 1.10.0:
+#  - New: Drives submenu in pbs-menu (item 2): Drive details, Add a drive, Change the CHAP login,
+#    Remove a drive
+#  - New: --add-drive - connect one more Synology LUN with its own mount path, datastore and monitor.
+#    Only the drive questions are asked (no repository, upgrade, popup or login-screen steps)
+#  - New: --remove-drive - takes a drive away in the safe order: refuses while a task runs on its
+#    datastore, removes the datastore from PBS (the files stay on the LUN), stops the monitor,
+#    unmounts, removes the fstab line (copy kept), removes the boot-order file, and logs out of the
+#    target - but only when no other drive uses it. You must type the drive name to confirm.
+#    It never erases data and never changes anything on the Synology
+#  - Fixed: adding a drive whose name starts like an existing one (synology / synology2) could
+#    remove the other drive's cron job
+#  - Fixed: a drive set up earlier is no longer offered as a "stale record" when you add a second one
 #
 # Changes in 1.9.3:
 #  - Fixed: in pbs-menu, a long screen (LUN & connection with two drives, the health check, the
@@ -141,7 +157,7 @@
 set -eE
 export LC_ALL=C.UTF-8
 
-VERSION="1.9.3"
+VERSION="1.10.0"
 LOG_FILE="/var/log/pbs-post-install.log"
 FS_LABEL="pbs-data"
 FOUR_TIB=4398046511104
@@ -193,6 +209,7 @@ DO_ISCSI=1
 DO_DS=1
 DO_NAG=1
 DO_MOTD=1
+ADD_DRIVE=0          # 1 = --add-drive: only connect another drive (no repo/upgrade/popup/login-screen steps)
 MOTD_MODE="prompt"   # prompt | dashboard | live
 GUIDE_DONE=0
 declare -a NOTES=()
@@ -938,6 +955,20 @@ stored_chap_state() {
     node_auth_state "$PORTAL_IP" "$TARGET_IQN"
 }
 
+# "iqn|portal" of every drive that was set up by this script (read from its monitor script)
+installed_nodes() {
+    local f TARGET PORTAL
+    for f in /usr/local/bin/check-iscsi-session-*.sh; do
+        if [[ ! -f "$f" ]]; then continue; fi
+        TARGET=""; PORTAL=""
+        # shellcheck disable=SC1090
+        source <(grep -E '^(TARGET|PORTAL)=' "$f")
+        if [[ -n "$TARGET" ]]; then
+            echo "${TARGET}|$(norm_portal "$PORTAL")"
+        fi
+    done
+}
+
 # "address:port" without the ",tpgt" that iscsiadm appends
 norm_portal() {
     local p="${1%%,*}"
@@ -981,6 +1012,7 @@ offer_stale_cleanup() {
     local -a stale=()
     local rec portal iqn startup auth broken=0 choice def=1 line
     KNOWN_NODES=("${TARGET_IQN}|$(norm_portal "$PORTAL_IP")")
+    mapfile -t -O 1 KNOWN_NODES < <(installed_nodes)    # drives set up earlier are never "stale"
     mapfile -t stale < <(find_stale_records)
     if [[ ${#stale[@]} -eq 0 ]]; then
         return 0
@@ -1969,6 +2001,10 @@ ask_mount_path() {
             err "${MOUNT_PATH} exists and is not empty - choose an empty or new directory."
             continue
         fi
+        if [[ $ADD_DRIVE -eq 1 && -e "/usr/local/bin/check-iscsi-session-$(basename "$MOUNT_PATH").sh" ]]; then
+            err "A drive called '$(basename "$MOUNT_PATH")' is already set up - choose a different last part of the path."
+            continue
+        fi
         if awk -v p="$MOUNT_PATH" '!/^[[:space:]]*#/ && $2 == p { f = 1 } END { exit !f }' /etc/fstab; then
             warn "/etc/fstab already has an entry for ${MOUNT_PATH} - it will be replaced (a backup is kept)."
         fi
@@ -2124,6 +2160,11 @@ setup_mount_ds() {
     if [[ $DO_ISCSI -eq 1 ]]; then
         if [[ "$DISK_ACTION" == "mounted" ]]; then
             MOUNT_PATH="$PROBE_MOUNTED_AT"
+            if [[ $ADD_DRIVE -eq 1 && -f "/usr/local/bin/check-iscsi-session-$(basename "$MOUNT_PATH").sh" ]]; then
+                err "This LUN is already set up as a drive (${MOUNT_PATH}). Nothing was changed."
+                echo "  ${DIM}To add another drive, create a new LUN on the Synology and choose that one.${NC}"
+                exit 0
+            fi
             ok "The LUN stays mounted at ${MOUNT_PATH}"
         else
             ask_mount_path
@@ -2227,9 +2268,13 @@ setup_review() {
 }
 
 run_setup() {
-    setup_welcome
+    if [[ $ADD_DRIVE -eq 0 ]]; then
+        setup_welcome
+    fi
     while true; do
-        setup_options
+        if [[ $ADD_DRIVE -eq 0 ]]; then
+            setup_options
+        fi
         if [[ $DO_ISCSI -eq 1 ]]; then
             setup_tools
             setup_synology_guide
@@ -2732,6 +2777,12 @@ send_test_alert() {
     esac
 }
 
+# The crontab without the monitor line of one drive (exact name: "synology" never matches "synology2")
+cron_without_monitor() {
+    crontab -l 2>/dev/null | awk -v s="# iSCSI monitor for $1" '
+        !(length($0) >= length(s) && substr($0, length($0) - length(s) + 1) == s)' || true
+}
+
 step_monitor() {
     local service_name cron_job tmp_cron detail="health check + auto-repair every minute"
     local mount_unit svc dir conf
@@ -2743,7 +2794,7 @@ step_monitor() {
 
     cron_job="*/1 * * * * $CHECK_ISCSI_SCRIPT # iSCSI monitor for $service_name"
     tmp_cron=$(mktemp)
-    crontab -l 2>/dev/null | grep -v "# iSCSI monitor for $service_name" > "$tmp_cron" || true
+    cron_without_monitor "$service_name" > "$tmp_cron" || true
     echo "$cron_job" >> "$tmp_cron"
     crontab "$tmp_cron"
     rm -f "$tmp_cron"
@@ -3785,7 +3836,7 @@ screen_lun() {
         # shellcheck disable=SC1090
         source <(grep -E '^(TARGET|PORTAL|MOUNT_PATH)=' "$s")
         echo
-        panel_top "LUN & connection · ${MOUNT_PATH}"
+        panel_top "Drive details · ${MOUNT_PATH}"
         kv "Target" "${TARGET}"
         kv "Synology" "${PORTAL}"
         kv "This server" "${iqn:-unknown}"
@@ -3810,6 +3861,43 @@ screen_lun() {
     panel_top "Disks"
     lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,TRAN 2>/dev/null | while IFS= read -r line; do panel_line "$line"; done
     panel_bottom
+}
+
+screen_drives() {   # the Drives submenu: details, add, CHAP login, remove
+    local c n
+    need_root || return 0
+    while true; do
+        clear_body
+        n=$(mon_scripts | wc -l)
+        echo
+        panel_top "Drives"
+        panel_line "${n} drive(s) set up on this server. ${DIM}Remove never erases data on the Synology.${NC}"
+        panel_bottom
+        menu_select c 0 \
+            "Drive details|Target, login, session details and disks of every drive (read-only)" \
+            "Add a drive|Connect another Synology LUN and create or re-attach its datastore" \
+            "Change the CHAP login|Type the username/password again (Synology log: CHAP required but absent)" \
+            "Remove a drive|Disconnect a LUN from this server and remove its datastore from PBS" \
+            "Back"
+        case "$c" in
+            0) page_run screen_lun; press_key ;;
+            1) drive_tool --add-drive; return 0 ;;
+            2) drive_tool --fix-login; return 0 ;;
+            3) drive_tool --remove-drive; return 0 ;;
+            *) return 0 ;;
+        esac
+    done
+}
+
+drive_tool() {   # runs the installer full-screen (it draws its own screens), then the menu comes back
+    term_reset
+    printf '\e[2J\e[H'
+    if [ -x "$INSTALLER" ]; then
+        "$INSTALLER" "$1" || true
+    else
+        echo "  ${YELLOW}The installer copy (${INSTALLER}) was not found - run: pbs-motd --update-installer${NC}"
+    fi
+    press_key
 }
 
 screen_storage() {
@@ -4238,11 +4326,11 @@ GRID_SEL=0
 menu_grid() {
     local sel="$1" r c i w k rest rc cols_w0=0 cols_w1=0 cols_w2=0 gl gap=2 cell txt pad
     local -a keys=(1 2 3 4 5 6 7 8 9 0 s q)
-    local -a labels=("Live view" "LUN & connection" "Storage" "Health check" "Check & repair" "Monitor log" \
+    local -a labels=("Live view" "Drives" "Storage" "Health check" "Check & repair" "Monitor log" \
                      "Services" "System updates" "Installer" "Help" "Settings" "Back to shell")
     local -a hints=(
         "The dashboard, refreshing every ${REFRESH_SECS} seconds"
-        "Target, login, session details, disks - and re-enter the CHAP login"
+        "Drive details, add a drive, CHAP login, remove a drive"
         "Free space, datastores, open tasks"
         "Full check including a test write (pbs-post-install.sh --status)"
         "Runs the monitor once - repairs a lost connection"
@@ -4340,10 +4428,7 @@ menu_main() {
         clear_body
         case "$c" in
             0) screen_watch; continue ;;
-            1) page_run screen_lun
-               if [ -x "$INSTALLER" ] && ask_yn "Type the CHAP login again (fix a rejected login)?"; then
-                   "$INSTALLER" --fix-login
-               fi ;;
+            1) screen_drives; continue ;;
             2) page_run screen_storage ;;
             3) page_run screen_health ;;
             4) screen_repair ;;
@@ -5385,6 +5470,279 @@ run_fix_login() {
     done
 }
 
+# ===========================================================================
+# DRIVE MANAGEMENT  (--add-drive / --remove-drive)
+# ===========================================================================
+# --add-drive: the normal setup, shortened to the drive: no repository, upgrade, popup or
+# login-screen questions. Suggests a free mount path and datastore name for the next drive.
+prepare_add_drive() {
+    local n=2 cand
+    DO_REPO=0; DO_UPGRADE=0; DO_NAG=0; DO_MOTD=0; DO_ISCSI=1; DO_DS=1
+    while true; do
+        cand="/mnt/synology${n}"
+        if [[ ! -e "/usr/local/bin/check-iscsi-session-synology${n}.sh" && ! -e "$cand" ]] \
+            && ! awk -v p="$cand" '!/^[[:space:]]*#/ && $2 == p { f = 1 } END { exit !f }' /etc/fstab; then
+            break
+        fi
+        n=$(( n + 1 ))
+    done
+    MOUNT_PATH="$cand"
+    DS_NAME="synology-backup-${n}"
+}
+
+# Datastores whose path is the mount point or a folder below it
+datastores_on() {
+    awk -v p="$1" '
+        /^datastore:/ { name = $2 }
+        $1 == "path" && ($2 == p || index($2, p "/") == 1) { print name }
+    ' "$DS_CFG" 2>/dev/null || true
+}
+
+# Number of PBS tasks that are running right now and mention "$1" (a datastore). "?" = cannot tell.
+running_tasks_for() {
+    local out
+    if ! out=$(timeout 20 proxmox-backup-manager task list --output-format json 2>/dev/null); then
+        echo "?"
+        return 0
+    fi
+    grep -oF "$1" <<< "$out" | wc -l || true
+}
+
+# --remove-drive: takes one drive away again, step by step, in the safe order.
+# It NEVER erases data on the LUN and never touches anything on the Synology.
+run_remove_drive() {
+    local -a scripts=() items=()
+    local f s TARGET PORTAL MOUNT_PATH name script choice ds_list ds busy shared=0 tmp
+    local pbs_stopped=0 confirm users failed=0
+
+    if [[ $EUID -ne 0 ]]; then
+        echo "--remove-drive needs root. Run:  sudo $0 --remove-drive" >&2
+        return 2
+    fi
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        echo "--remove-drive is interactive - run it in a terminal." >&2
+        return 2
+    fi
+    touch "$LOG_FILE"; chmod 600 "$LOG_FILE"
+    INSTALL_STARTED=1
+    echo "=== remove-drive v${VERSION} started $(date '+%F %T')" >> "$LOG_FILE"
+
+    for f in /usr/local/bin/check-iscsi-session-*.sh; do
+        if [[ -f "$f" ]]; then scripts+=("$f"); fi
+    done
+    printf '\033[2J\033[H'
+    CURRENT_TASK="Remove a drive"
+    render_banner
+    echo
+    if [[ ${#scripts[@]} -eq 0 ]]; then
+        info "No drive set up by this installer was found - nothing to remove."
+        return 0
+    fi
+
+    # ---- which drive?
+    for s in "${scripts[@]}"; do
+        TARGET=""; PORTAL=""; MOUNT_PATH=""
+        # shellcheck disable=SC1090
+        source <(grep -E '^(TARGET|PORTAL|MOUNT_PATH)=' "$s")
+        ds_list=$(datastores_on "$MOUNT_PATH" | paste -sd, - || true)
+        items+=("$(basename "$MOUNT_PATH")|${MOUNT_PATH} · ${TARGET##*:} · datastore: ${ds_list:-none}")
+    done
+    items+=("Cancel|Nothing is changed")
+    echo "  ${WHITE}Which drive do you want to remove?${NC}"
+    menu_select choice 0 "${items[@]}"
+    if [[ $choice -ge ${#scripts[@]} ]]; then
+        echo "  ${YELLOW}Cancelled - nothing was changed.${NC}"
+        return 0
+    fi
+    script="${scripts[choice]}"
+    TARGET=""; PORTAL=""; MOUNT_PATH=""
+    # shellcheck disable=SC1090
+    source <(grep -E '^(TARGET|PORTAL|MOUNT_PATH)=' "$script")
+    if [[ -z "$TARGET" || -z "$PORTAL" || -z "$MOUNT_PATH" ]]; then
+        err "Could not read the drive details from ${script} - nothing was changed."
+        return 1
+    fi
+    name=$(basename "$MOUNT_PATH")
+    ds_list=$(datastores_on "$MOUNT_PATH" | paste -sd' ' - || true)
+    for f in "${scripts[@]}"; do
+        if [[ "$f" != "$script" ]] && grep -qF "TARGET=$(printf '%q' "$TARGET")" "$f"; then
+            shared=1
+        fi
+    done
+
+    # ---- is it safe right now?
+    for ds in $ds_list; do
+        busy=$(running_tasks_for "$ds")
+        if [[ "$busy" == "?" ]]; then
+            warn "Could not ask PBS whether a backup is running on '${ds}'. Check the web UI (Administration › Tasks) before you continue."
+        elif [[ "$busy" -gt 0 ]]; then
+            err "A task is running on datastore '${ds}' (backup, verify, garbage collection or sync). Wait for it to finish, then run this again. Nothing was changed."
+            return 1
+        fi
+    done
+
+    # ---- the plan
+    echo
+    panel_top "Remove drive · ${name}" "$YELLOW"
+    kv "Mount path" "$MOUNT_PATH"
+    kv "Target" "$TARGET"
+    kv "Synology" "$PORTAL"
+    kv "PBS datastore" "${ds_list:-${DIM}none on this drive${NC}}"
+    panel_blank
+    panel_line "${WHITE}This will:${NC}"
+    if [[ -n "$ds_list" ]]; then
+        panel_line "  1. remove the datastore from PBS ${DIM}(the backup files stay on the LUN)${NC}"
+    else
+        panel_line "  1. ${DIM}(no PBS datastore on this drive)${NC}"
+    fi
+    panel_line "  2. stop the monitor and its cron job"
+    panel_line "  3. unmount ${MOUNT_PATH} and remove its /etc/fstab line ${DIM}(a copy is kept)${NC}"
+    panel_line "  4. remove the boot-order file for PBS"
+    if [[ $shared -eq 1 ]]; then
+        panel_line "  5. ${YELLOW}keep the iSCSI login${NC} ${DIM}- another drive uses the same target${NC}"
+    else
+        panel_line "  5. log out of the target and delete its saved settings on this server"
+    fi
+    panel_blank
+    panel_line "${WHITE}It will NOT:${NC} erase anything on the LUN, or change anything on the Synology."
+    panel_blank
+    panel_line "${DIM}Afterwards you remove the storage entry in Proxmox VE and, if you want the${NC}"
+    panel_line "${DIM}space back, the LUN on the Synology. You get a reminder at the end.${NC}"
+    panel_bottom
+    echo
+    echo "  ${RED}⚠  Backups on this datastore will no longer be reachable from PBS.${NC}"
+    ask_input confirm "Type the drive name (${name}) to continue, or press Enter to cancel"
+    if [[ "$confirm" != "$name" ]]; then
+        echo "  ${YELLOW}Cancelled - nothing was changed.${NC}"
+        return 0
+    fi
+    echo
+
+    # ---- 1. PBS datastore (the files stay: no --destroy-data)
+    for ds in $ds_list; do
+        run_quiet_soft "Removing datastore '${ds}' from PBS" proxmox-backup-manager datastore remove "$ds"
+        if [[ $RUN_RC -ne 0 ]]; then
+            err "PBS could not remove '${ds}' (exit code ${RUN_RC}). Nothing else was changed. Log: ${LOG_FILE}"
+            return 1
+        fi
+        ok "Datastore '${ds}' removed from PBS ${DIM}(files kept on the LUN)${NC}"
+    done
+
+    # ---- 2. monitor: cron first, so it cannot "repair" the drive we are taking away
+    tmp=$(mktemp)
+    cron_without_monitor "$name" > "$tmp"
+    crontab "$tmp"
+    rm -f "$tmp"
+    flock -w 30 "/run/lock/iscsi-monitor-${name}.lock" true 2>/dev/null || true
+    ok "Monitor stopped (cron job removed)"
+
+    # ---- 3. unmount
+    if mountpoint -q "$MOUNT_PATH"; then
+        sync
+        if ! umount "$MOUNT_PATH" >> "$LOG_FILE" 2>&1; then
+            warn "${MOUNT_PATH} is busy - something still uses it:"
+            users=$(fuser -vm "$MOUNT_PATH" 2>&1 | head -n 8 || true)
+            if [[ -n "$users" ]]; then
+                while IFS= read -r f; do echo "    ${DIM}${f}${NC}"; done <<< "$users"
+            fi
+            menu_select choice 0 \
+                "Stop PBS for a moment and try again|PBS is started again afterwards" \
+                "Leave the drive mounted|Stop here - you can run Remove again later"
+            if [[ $choice -eq 0 ]]; then
+                systemctl stop proxmox-backup-proxy proxmox-backup >> "$LOG_FILE" 2>&1 || true
+                pbs_stopped=1
+                sleep 2
+                umount "$MOUNT_PATH" >> "$LOG_FILE" 2>&1 || true
+            fi
+        fi
+        if mountpoint -q "$MOUNT_PATH"; then
+            if [[ $pbs_stopped -eq 1 ]]; then
+                systemctl start proxmox-backup proxmox-backup-proxy >> "$LOG_FILE" 2>&1 || true
+            fi
+            tmp=$(mktemp)
+            { cron_without_monitor "$name"; echo "*/1 * * * * ${script} # iSCSI monitor for ${name}"; } > "$tmp"
+            crontab "$tmp"
+            rm -f "$tmp"
+            echo
+            err "${MOUNT_PATH} is still mounted. Stopped here:"
+            echo "    ${DIM}• the datastore is removed from PBS${NC}"
+            echo "    ${DIM}• the mount, fstab line and iSCSI login are untouched, and the monitor runs again${NC}"
+            echo "    ${DIM}Close whatever uses the drive, then run Remove again (Drives › Remove a drive).${NC}"
+            return 1
+        fi
+    fi
+    ok "Unmounted ${MOUNT_PATH}"
+
+    # ---- fstab (a copy is kept)
+    if awk -v p="$MOUNT_PATH" '!/^[[:space:]]*#/ && $2 == p { f = 1 } END { exit !f }' /etc/fstab; then
+        cp /etc/fstab "/etc/fstab.backup.$(date +%Y%m%d-%H%M%S)"
+        tmp=$(mktemp)
+        awk -v p="$MOUNT_PATH" '/^[[:space:]]*#/ || $2 != p' /etc/fstab > "$tmp"
+        cat "$tmp" > /etc/fstab
+        rm -f "$tmp"
+        ok "Removed the /etc/fstab line ${DIM}(copy: /etc/fstab.backup.*)${NC}"
+    fi
+
+    # ---- the empty mount directory (made immutable by the installer)
+    if [[ -d "$MOUNT_PATH" ]]; then
+        chattr -i "$MOUNT_PATH" 2>/dev/null || true
+        if [[ -z "$(ls -A "$MOUNT_PATH" 2>/dev/null)" ]]; then
+            rmdir "$MOUNT_PATH" 2>/dev/null && ok "Removed the empty directory ${MOUNT_PATH}"
+        else
+            warn "${MOUNT_PATH} is not empty (files on the local disk) - left in place"
+        fi
+    fi
+
+    # ---- boot order, monitor files
+    for f in proxmox-backup proxmox-backup-proxy; do
+        rm -f "/etc/systemd/system/${f}.service.d/10-iscsi-${name}.conf"
+        rmdir "/etc/systemd/system/${f}.service.d" 2>/dev/null || true
+    done
+    systemctl daemon-reload
+    rm -f "$script" "/etc/pbs-iscsi-monitor-${name}.conf" "/run/lock/iscsi-monitor-${name}.lock" \
+          "/run/iscsi-monitor-${name}.state" "/run/iscsi-monitor-${name}.state."*
+    ok "Monitor files and boot-order file removed"
+
+    # ---- iSCSI login: only when no other drive uses the same target
+    if [[ $shared -eq 1 ]]; then
+        info "The iSCSI login is kept - another drive uses the same target."
+    else
+        run_quiet_soft "Logging out of the target" timeout 60 iscsiadm -m node -T "$TARGET" -p "$PORTAL" --logout
+        if [[ $RUN_RC -ne 0 && $RUN_RC -ne 21 ]]; then
+            warn "Logout did not finish cleanly (exit code ${RUN_RC}) - see ${LOG_FILE}"
+            failed=1
+        fi
+        if iscsiadm -m node -T "$TARGET" -p "$PORTAL" -o delete >> "$LOG_FILE" 2>&1; then
+            ok "iSCSI settings for the target deleted on this server"
+        else
+            warn "Could not delete the saved iSCSI settings - remove them with: iscsiadm -m node -T ${TARGET} -p ${PORTAL} -o delete"
+            failed=1
+        fi
+    fi
+
+    if [[ $pbs_stopped -eq 1 ]]; then
+        systemctl start proxmox-backup proxmox-backup-proxy >> "$LOG_FILE" 2>&1 || true
+        ok "PBS started again"
+    fi
+    echo "OK    drive ${name} removed" >> "$LOG_FILE"
+
+    echo
+    if [[ $failed -eq 0 ]]; then
+        echo "  ${GREEN}✔  Drive '${name}' is removed from this server.${NC}"
+    else
+        echo "  ${YELLOW}⚠  Drive '${name}' is removed, with the notes above.${NC}"
+    fi
+    echo
+    panel_top "Still to do by hand" "$GREEN"
+    panel_line "${WHITE}Proxmox VE${NC}   Datacenter › Storage: remove the storage entry that pointed to"
+    panel_line "              ${ds_list:-this datastore}, and check your backup jobs."
+    panel_line "${WHITE}Synology${NC}     Only if you want the space back: SAN Manager › LUN › delete the LUN"
+    panel_line "              (this deletes the backups on it for good), then the target if it is unused."
+    panel_line "${DIM}Until you delete the LUN on the Synology, the backups are still on it.${NC}"
+    panel_bottom
+    echo
+}
+
 usage() {
     cat <<EOF
 PBS Post-Install v${VERSION}
@@ -5394,6 +5752,8 @@ PBS Post-Install v${VERSION}
                                      exit code 0 = healthy, 1 = problem found, 2 = not installed
   ./pbs-post-install.sh --fix-login  type the CHAP username/password again for an installed
                                      target (Synology log: "CHAP required but absent")
+  ./pbs-post-install.sh --add-drive  connect one more Synology LUN (own mount path, datastore, monitor)
+  ./pbs-post-install.sh --remove-drive  take a drive away again (datastore, monitor, mount, iSCSI login)
   ./pbs-post-install.sh --motd       install / update only the login dashboard + menu
   ./pbs-post-install.sh --motd-remove  remove the login screen (restores /etc/motd)
   ./pbs-post-install.sh --motd-update  update login screen + installer copy, keep all settings
@@ -5410,6 +5770,11 @@ main() {
     local rc=0
     case "${1:-}" in
         "") ;;
+        --add-drive) ADD_DRIVE=1 ;;
+        --remove-drive)
+            run_remove_drive || rc=$?
+            exit "$rc"
+            ;;
         --status|-s)
             run_status || rc=$?
             exit "$rc"
@@ -5445,6 +5810,9 @@ main() {
             ;;
     esac
     preflight
+    if [[ $ADD_DRIVE -eq 1 ]]; then
+        prepare_add_drive
+    fi
     run_setup
     run_install
 }
