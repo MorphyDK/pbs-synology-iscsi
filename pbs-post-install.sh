@@ -7,7 +7,7 @@
 # 
 # Thanks to Derek Seaman's Tech Blog who inspired me to make this.
 #
-# Version 1.9.1  21/10-2026
+# Version 1.9.2  21/10-2026
 # Author MorphyDK
 #
 # Usage:  ./pbs-post-install.sh              interactive installer
@@ -17,6 +17,17 @@
 #         ./pbs-post-install.sh --motd-remove  remove the login screen again
 #         ./pbs-post-install.sh --motd-update  silent update of the login screen, keeps settings
 #         ./pbs-post-install.sh --help
+#
+# Changes in 1.9.2:
+#  - The menu (pbs-menu) has a new look: the logo and the status pill stay FROZEN at the top
+#    (a slim header on a small terminal), and every menu and screen scrolls below it
+#  - Drive cards at the top of the menu: a small drive icon per LUN with thin/thick, filesystem,
+#    size, a usage bar, free space and connection status
+#  - The menu items are grouped (Watch, Check, System, Other) in a grid you move through with the
+#    arrow keys; every item has a shortcut (number or letter). Badges show what needs attention:
+#    updates waiting, a new installer, PBS stopped, a drive with a problem
+#  - Fixed: items 10-12 of the old menu were shifted one space, and could not be jumped to
+#  - ShellCheck clean-up: unused variables removed, a few lines rewritten. No change in behaviour
 #
 # Changes in 1.9.1:
 #  - The reads/writes graph only uses characters that every terminal font has (· ░ ▒ ▓ █).
@@ -125,7 +136,7 @@
 set -eE
 export LC_ALL=C.UTF-8
 
-VERSION="1.9.1"
+VERSION="1.9.2"
 LOG_FILE="/var/log/pbs-post-install.log"
 FS_LABEL="pbs-data"
 FOUR_TIB=4398046511104
@@ -222,7 +233,6 @@ LUN_LAYOUT=""
 PROBE_NODE=""
 PROBE_FS=""
 PROBE_UUID=""
-PROBE_LABEL=""
 PROBE_OTHER=""
 PROBE_MOUNTED_AT=""
 PROBE_INSPECTED=0
@@ -715,6 +725,7 @@ _run_with_spinner() {
                 last_sz=$sz
                 last_change=$MONO
                 # Progress meters (mkfs) redraw one line with \r and backspaces: show the newest value
+                # shellcheck disable=SC2020
                 last_line=$(tail -c 400 "$LOG_FILE" 2>/dev/null | tr '\b\r' '\n\n' | tr -cd '[:print:]\n' \
                     | grep -v '^[[:space:]]*$' | tail -n 1 | sed 's/^[[:space:]]*//')
                 if [[ "$last_line" =~ ^([0-9]+)/([0-9]+)$ && ${BASH_REMATCH[2]} -gt 0 ]]; then
@@ -1201,9 +1212,9 @@ release_holders() {
 #   thick     thick LUN: space is reserved, nothing can be given back
 #   unknown   the disk does not say
 lun_provisioning() {
-    local d="$1" mode b5 b6 type=0
+    local d="$1" mode b6 type=0
     mode=$(cat /sys/block/"${d}"/device/scsi_disk/*/provisioning_mode 2>/dev/null | head -n 1 || true)
-    read -r b5 b6 < <(od -An -tu1 -j5 -N2 "/sys/block/${d}/device/vpd_pgb2" 2>/dev/null) || true
+    read -r _ b6 < <(od -An -tu1 -j5 -N2 "/sys/block/${d}/device/vpd_pgb2" 2>/dev/null) || true
     if [[ "${b6:-}" =~ ^[0-9]+$ ]]; then
         type=$(( b6 & 7 ))        # 1 = resource provisioned (thick), 2 = thin provisioned
     fi
@@ -1225,7 +1236,7 @@ probe_lun() {
     local -a parts=() candidates=()
     base=$(basename "$dev")
 
-    PROBE_NODE=""; PROBE_FS=""; PROBE_UUID=""; PROBE_LABEL=""; PROBE_OTHER=""
+    PROBE_NODE=""; PROBE_FS=""; PROBE_UUID=""; PROBE_OTHER=""
     PROBE_MOUNTED_AT=""; PROBE_INSPECTED=0; PROBE_PBS=0; PROBE_PBS_SUB=""
     PROBE_GROUPS=0; PROBE_LATEST=""; PROBE_USED=""; PROBE_FILES=0
 
@@ -1282,7 +1293,6 @@ probe_lun() {
         return 0
     fi
     PROBE_UUID=$(blkid -p -s UUID -o value "$PROBE_NODE" 2>/dev/null || true)
-    PROBE_LABEL=$(blkid -p -s LABEL -o value "$PROBE_NODE" 2>/dev/null || true)
     PROBE_MOUNTED_AT=$(findmnt -nro TARGET -S "$PROBE_NODE" 2>/dev/null | head -n 1 || true)
 
     dir=""
@@ -1418,7 +1428,9 @@ preflight() {
     chmod 600 "$LOG_FILE"
     echo "=== PBS post-install v${VERSION} started $(date '+%F %T')" >> "$LOG_FILE"
 
+    # shellcheck disable=SC1091
     OS_CODENAME=$(. /etc/os-release && echo "${VERSION_CODENAME:-}")
+    # shellcheck disable=SC1091
     OS_PRETTY=$(. /etc/os-release && echo "${PRETTY_NAME:-Debian}")
     if [[ -z "$OS_CODENAME" ]]; then
         OS_CODENAME=$(lsb_release -cs 2>/dev/null || true)
@@ -1521,7 +1533,9 @@ setup_tools() {
         panel_line "${GREEN}This does not touch any disk.${NC}"
         panel_bottom
         echo
-        [[ ${DO_REPO:-0} -eq 1 ]] && disable_enterprise_repos || true
+        if [[ ${DO_REPO:-0} -eq 1 ]]; then
+            disable_enterprise_repos || true
+        fi
         apt_update
         run_quiet "Installing open-iscsi, parted and xfsprogs" \
             "${APT_ENV[@]}" apt-get "${APT_OPTS[@]}" install open-iscsi parted xfsprogs
@@ -2611,7 +2625,7 @@ repair() {
         return 1
     fi
     udevadm settle --timeout=20 >/dev/null 2>&1
-    for i in 1 2 3 4 5 6 7 8 9 10; do
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
         if timeout -k 5 60 mount "$MOUNT_PATH" >/dev/null 2>&1; then
             break
         fi
@@ -2904,9 +2918,9 @@ st_down() {
 
 # thin | thin-off | thick | unknown  (see pbs-post-install.sh, lun_provisioning)
 lun_provisioning() {
-    local d="$1" mode b5 b6 type=0
+    local d="$1" mode b6 type=0
     mode=$(cat /sys/block/"${d}"/device/scsi_disk/*/provisioning_mode 2>/dev/null | head -n 1)
-    read -r b5 b6 < <(od -An -tu1 -j5 -N2 "/sys/block/${d}/device/vpd_pgb2" 2>/dev/null)
+    read -r _ b6 < <(od -An -tu1 -j5 -N2 "/sys/block/${d}/device/vpd_pgb2" 2>/dev/null)
     case "${b6:-}" in ''|*[!0-9]*) ;; *) type=$(( b6 & 7 )) ;; esac
     if [ "$type" -eq 1 ]; then echo thick
     elif [ "$mode" = "unmap" ]; then echo thin
@@ -2987,6 +3001,7 @@ REBOOT_NEEDED=0; RUNNING_K=""; INSTALLED_K=""
 reboot_info() {
     local newest
     RUNNING_K=$(uname -r)
+    # shellcheck disable=SC2012
     newest=$(ls -1 "$BOOT_DIR"/vmlinuz-* 2>/dev/null | sed 's#.*/vmlinuz-##' | sort -V | tail -n 1)
     INSTALLED_K="${newest:-$RUNNING_K}"
     REBOOT_NEEDED=0
@@ -3016,11 +3031,11 @@ http_get() {   # http_get URL  -> body on stdout
 }
 
 check_release() {
-    local json new tag ok try now
+    local json new tag ok now
     now=$(date +%s)
     mkdir -p "$(dirname "$REL_FILE")"
-    tag=""; ok=0; try=0
-    [ -r "$REL_FILE" ] && IFS='|' read -r tag ok try < "$REL_FILE"
+    tag=""; ok=0
+    [ -r "$REL_FILE" ] && IFS='|' read -r tag ok _ < "$REL_FILE"
     json=$(http_get "https://api.github.com/repos/${GH_REPO}/releases/latest" 2>/dev/null) || json=""
     new=$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' <<< "$json" | head -n 1)
     new=${new#v}
@@ -3056,6 +3071,7 @@ load_release() {
 
 ulog() {   # ulog "text" - screen unless quiet, and the log file
     [ "${QUIET_UPDATE:-0}" = "1" ] || echo "  $*"
+    # shellcheck disable=SC2001
     printf '%s %s\n' "$(date '+%F %T')" "$(sed 's/\x1b\[[0-9;]*m//g' <<< "$*")" >> "$UPD_LOG" 2>/dev/null
     return 0
 }
@@ -3214,7 +3230,7 @@ mount_disk() {   # mount_disk /mnt/path -> disk name (sdb)
 }
 
 sample_io() {
-    local s MOUNT_PATH dd a b c d e f g h cs pcs pa pc pd pe pg ph dt rr wr dio lr lw prev hist
+    local s MOUNT_PATH dd a c d e g h cs pcs pa pc pd pe pg ph dt rr wr dio lr lw prev
     cs=$(cut -d' ' -f1 /proc/uptime)
     cs=$(( 10#${cs/./} ))
     IO_LIVE=1
@@ -3225,7 +3241,7 @@ sample_io() {
         source <(grep -E '^MOUNT_PATH=' "$s")
         dd=$(mount_disk "$MOUNT_PATH") || continue
         [ -r "/sys/block/${dd}/stat" ] || continue
-        read -r a b c d e f g h _ < "/sys/block/${dd}/stat"
+        read -r a _ c d e _ g h _ < "/sys/block/${dd}/stat"
         prev="${IO_PREV[$dd]:-}"
         IO_PREV[$dd]="$cs $a $c $d $e $g $h"
         [ -n "$prev" ] || continue
@@ -3298,6 +3314,7 @@ panel_io() {
 
 panel_server() {
     local os kernel up load ncpu mt ma mpct rsz rused rpct d h m
+    # shellcheck disable=SC1091
     os=$( . /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-Linux}" )
     kernel=$(uname -r)
     up=$(cut -d' ' -f1 /proc/uptime | cut -d. -f1)
@@ -3348,12 +3365,11 @@ panel_server() {
 
 panel_iscsi() {
     local script="$1" TARGET="" PORTAL="" MOUNT_PATH="" STATE_FILE=""
-    local sname state disk sid rt src fstype opts size used avail pct dev dsize tmo
+    local state sid rt src fstype opts size used avail pct dev dsize tmo
     local auth_file last events cutoff ago disc dd
     # shellcheck disable=SC1090
     source <(grep -E '^(TARGET|PORTAL|MOUNT_PATH|STATE_FILE)=' "$script" 2>/dev/null)
     [ -z "$TARGET" ] || [ -z "$MOUNT_PATH" ] && return 0
-    sname=$(basename "$MOUNT_PATH")
     echo
     panel_top "iSCSI storage · ${MOUNT_PATH}"
     st_info "Synology" "${PORTAL%%:*}   ${DIM}${TARGET##*:}${NC}"
@@ -3361,7 +3377,6 @@ panel_iscsi() {
     # --- session ---
     state=$(awk -v t="$TARGET" '/^[[:space:]]*Target:/ { in_t = ($2 == t) } in_t && /iSCSI Session State:/ { print $NF; exit }' <<< "$SESS3")
     sid=$(awk -v t="$TARGET" '$4 == t { gsub(/\[|\]/, "", $2); print $2; exit }' <<< "$SESS1")
-    disk=$(awk -v t="$TARGET" '/^[[:space:]]*Target:/ { in_t = ($2 == t) } in_t && /Attached scsi disk/ { print $4; exit }' <<< "$SESS3")
     auth_file="${STATE_FILE}.authfail"
     if [ -n "$sid" ]; then
         if [ -z "$state" ] || [ "$state" = "LOGGED_IN" ]; then
@@ -3464,7 +3479,7 @@ list_datastores() {
 }
 
 panel_datastore() {
-    local line name path running n=0 types t
+    local line name path n=0 types
     local -a ds=()
     mapfile -t ds < <(list_datastores)
     echo
@@ -3724,7 +3739,7 @@ menu_select() {
 # ---------------------------------------------------------------- screens
 need_root() {
     if [ "$(id -u)" -ne 0 ]; then
-        echo "  ${YELLOW}This needs root - run:  sudo $0 $*${NC}" >&2
+        echo "  ${YELLOW}This needs root - run:  sudo $0${NC}" >&2
         return 1
     fi
 }
@@ -3738,11 +3753,13 @@ mon_scripts() {
 
 screen_watch() {
     local out k
+    frame_close
     printf '\e[?25l\e[2J'
     trap 'printf "\e[?25h"; exit 0' INT TERM
     while true; do
         sample_io
         out=$(render_dashboard 2>&1)
+        # shellcheck disable=SC2001
         printf '\e[H%s\n' "$(sed 's/$/\x1b[K/' <<< "$out")"
         printf '\n  %sLive view · refreshes every 3 seconds · %s · q to quit%s\e[K\n\e[J' "$DIM" "$(date '+%H:%M:%S')" "$NC"
         k=""
@@ -3863,7 +3880,7 @@ screen_log() {
 screen_services() {
     local u st c
     while true; do
-        printf '\e[2J\e[H'
+        clear_body
         echo
         panel_top "Services"
         for u in proxmox-backup proxmox-backup-proxy iscsid cron fstrim.timer; do
@@ -3990,7 +4007,7 @@ screen_settings() {
     local c cur
     need_root || return 0
     while true; do
-        printf '\e[2J\e[H'
+        clear_body
         echo
         panel_top "Settings"
         kv "Login screen" "${MODE}$( [ "$MODE" = "live" ] && echo " ${DIM}(stays open until q)${NC}" )"
@@ -4039,28 +4056,225 @@ screen_settings() {
     done
 }
 
-menu_main() {
-    local c=0 rc
-    need_root || exit 1
+# ---------------------------------------------------------------- frozen header + drive cards (menus)
+# In the menus the logo and the status pill stay at the top; the menu and every screen scroll in
+# the part below (a terminal scroll region). On a small terminal a slim 3-line header is used.
+FRAME=0; HDR_H=0
+term_reset() { printf '\e[r\e[?25h'; }
+
+DRV_NAME=(); DRV_STATE=(); DRV_FS=(); DRV_PCT=(); DRV_AVAIL=(); DRV_SIZE=(); DRV_PROV=()
+MENU_PROB=0; MENU_PILL=""; SVC_OK=1
+menu_collect() {   # the state of every drive + services: feeds the header pill, the cards and the badges
+    local s TARGET MOUNT_PATH src up fs size used avail pct dd opts prov ro i=0
+    DRV_NAME=(); DRV_STATE=(); DRV_FS=(); DRV_PCT=(); DRV_AVAIL=(); DRV_SIZE=(); DRV_PROV=()
+    IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+    MENU_PROB=0; SVC_OK=1
+    gather_sessions
+    while read -r -u 3 s; do
+        [ -z "$s" ] && continue
+        TARGET=""; MOUNT_PATH=""
+        # shellcheck disable=SC1090
+        source <(grep -E '^(TARGET|MOUNT_PATH)=' "$s")
+        up=0
+        grep -qF "$TARGET" <<< "$SESS1" && up=1
+        src=$(findmnt -rn -M "$MOUNT_PATH" -o SOURCE 2>/dev/null)
+        fs=""; pct=0; avail=0; size=0; used=0; prov=""; ro=0
+        if [ -n "$src" ]; then
+            fs=$(findmnt -rn -M "$MOUNT_PATH" -o FSTYPE 2>/dev/null)
+            opts=$(findmnt -rn -M "$MOUNT_PATH" -o OPTIONS 2>/dev/null)
+            case ",${opts}," in *,ro,*) ro=1 ;; esac
+            read -r size used avail < <(timeout 3 df -B1 --output=size,used,avail "$MOUNT_PATH" 2>/dev/null | tail -n 1)
+            case "${size:-x}" in ''|*[!0-9]*) size=0; used=0; avail=0 ;; esac
+            [ "$size" -gt 0 ] && pct=$(( used * 100 / size ))
+            if dd=$(mount_disk "$MOUNT_PATH"); then prov=$(lun_provisioning "$dd"); fi
+        fi
+        DRV_NAME[i]=$(basename "$MOUNT_PATH")
+        if [ "$up" -eq 0 ] || [ -z "$src" ]; then
+            DRV_STATE[i]=0; MENU_PROB=$(( MENU_PROB + 1 ))
+        elif [ "$ro" -eq 1 ]; then
+            DRV_STATE[i]=2; MENU_PROB=$(( MENU_PROB + 1 ))
+        else
+            DRV_STATE[i]=1
+        fi
+        DRV_FS[i]="$fs"; DRV_PCT[i]="$pct"; DRV_AVAIL[i]="$avail"; DRV_SIZE[i]="$size"; DRV_PROV[i]="$prov"
+        i=$(( i + 1 ))
+    done 3< <(mon_scripts)
+    if ! timeout 5 systemctl is-active --quiet proxmox-backup-proxy 2>/dev/null; then
+        SVC_OK=0; MENU_PROB=$(( MENU_PROB + 1 ))
+    fi
+    if [ "$MENU_PROB" -gt 0 ]; then
+        MENU_PILL="${RED}✘ ${MENU_PROB} PROBLEM(S) - needs attention${NC}"
+    else
+        MENU_PILL="${GREEN}● ALL SYSTEMS HEALTHY${NC}"
+    fi
+    load_updates; reboot_info; load_release
+    return 0
+}
+
+frame_open() {   # collect, draw the header at the top, keep it there
+    local hdr rows
+    rows=$(tput lines 2>/dev/null || echo 24)
+    case "$rows" in ''|*[!0-9]*) rows=24 ;; esac
+    COLS=$(term_cols)
+    menu_collect
+    if [ "$rows" -lt 16 ]; then          # too small for a frozen header: plain screens
+        FRAME=0; HDR_H=0
+        printf '\e[r\e[2J\e[H'
+        return 0
+    fi
+    SLIM=0
+    [ "$rows" -lt 34 ] && SLIM=1
+    hdr=$(banner "$MENU_PILL")
+    HDR_H=$(wc -l <<< "$hdr")
+    printf '\e[r\e[?25l\e[H\e[J%s\n' "$hdr"
+    printf '\e[%d;%dr\e[%d;1H\e[?25h' $(( HDR_H + 1 )) "$rows" $(( HDR_H + 1 ))
+    FRAME=1
+}
+
+clear_body() {   # clear everything below the frozen header (or the whole screen when there is none)
+    if [ "$FRAME" -eq 1 ]; then
+        printf '\e[%d;1H\e[J' $(( HDR_H + 1 ))
+    else
+        printf '\e[2J\e[H'
+    fi
+}
+
+frame_close() {
+    if [ "$FRAME" -eq 1 ]; then printf '\e[r'; fi
+    FRAME=0
+}
+
+menu_cards() {   # one small drive icon + status per LUN
+    local i n=${#DRV_NAME[@]} col status info prov
+    if [ "$n" -eq 0 ]; then
+        echo "  ${YELLOW}No iSCSI drive set up yet.${NC} ${DIM}Run pbs-post-install.sh${NC}"
+        return 0
+    fi
+    for (( i = 0; i < n; i++ )); do
+        case "${DRV_STATE[i]}" in
+            1) col="$GREEN"; status="${GREEN}● connected${NC}" ;;
+            2) col="$RED";   status="${RED}● READ-ONLY${NC}" ;;
+            *) col="$RED";   status="${RED}● not connected${NC}" ;;
+        esac
+        case "${DRV_PROV[i]}" in thin|thin-off) prov="thin" ;; thick) prov="thick" ;; *) prov="" ;; esac
+        info="${DRV_FS[i]:-no filesystem mounted}"
+        [ -n "$prov" ] && info="${prov} · ${info}"
+        [ "${DRV_SIZE[i]}" -gt 0 ] && info="${info} · $(hb "${DRV_SIZE[i]}")"
+        printf '  %s▄▄▄%s  %s%s%s  %s%s%s   %s\n' "$WHITE" "$NC" "$WHITE" "${DRV_NAME[i]}" "$NC" "$DIM" "$info" "$NC" "$status"
+        if [ "${DRV_STATE[i]}" -eq 0 ]; then
+            printf '  %s█%s●%s█%s  %swaiting for the NAS - the monitor reconnects by itself%s\n' "$WHITE" "$col" "$WHITE" "$NC" "$DIM" "$NC"
+        else
+            printf '  %s█%s●%s█%s  %s  %s%s%s free\n' "$WHITE" "$col" "$WHITE" "$NC" "$(bar "${DRV_PCT[i]}" 28)" "$WHITE" "$(hb "${DRV_AVAIL[i]}")" "$NC"
+        fi
+    done
+}
+
+# menu_grid: four groups (rows) of three items. Arrows move, Enter chooses, a number or letter is a
+# shortcut, q / Esc leaves. Result: the item number 0-11 in GRID_SEL.
+GRID_SEL=0
+menu_grid() {
+    local sel="$1" r c i w k rest rc cols_w0=0 cols_w1=0 cols_w2=0 gl gap=2 cell txt pad
+    local -a keys=(1 2 3 4 5 6 7 8 9 0 s q)
+    local -a labels=("Live view" "LUN & connection" "Storage" "Health check" "Check & repair" "Monitor log" \
+                     "Services" "System updates" "Installer" "Help" "Settings" "Back to shell")
+    local -a hints=(
+        "The dashboard, refreshing every ${REFRESH_SECS} seconds"
+        "Target, login, session details, disks - and re-enter the CHAP login"
+        "Free space, datastores, open tasks"
+        "Full check including a test write (pbs-post-install.sh --status)"
+        "Runs the monitor once - repairs a lost connection"
+        "The last events from the iSCSI monitor"
+        "Status of PBS, iSCSI and cron - restart PBS"
+        "Check for updates and install them - advises a reboot after kernel updates"
+        "Newer version of this installer / login screen on GitHub"
+        "The commands you will need"
+        "Login style, update question, installer check, auto-install"
+        "Leave the menu"
+    )
+    local -a badge=() bcol=() groups=("WATCH" "CHECK" "SYSTEM" "OTHER")
+    for (( i = 0; i < 12; i++ )); do badge[i]=""; bcol[i]=""; done
+    if [ "${MENU_PROB:-0}" -gt 0 ]; then badge[1]="[!]"; bcol[1]="$RED"; badge[4]="[!]"; bcol[4]="$RED"; fi
+    if [ "$SVC_OK" -eq 0 ]; then badge[6]="[!]"; bcol[6]="$RED"; fi
+    if [ "${UPD_N:-0}" -gt 0 ]; then badge[7]="[${UPD_N}]"; bcol[7]="$ALERT"
+    elif [ "$REBOOT_NEEDED" -eq 1 ]; then badge[7]="[reboot]"; bcol[7]="$ALERT"; fi
+    if [ "$REL_NEW" -eq 1 ]; then badge[8]="[NEW]"; bcol[8]="$ALERT"; hints[8]="v${REL_LATEST} is available - install it here"; fi
+
+    # column widths from the widest cell (label + badge), so the arrows line up
+    for (( i = 0; i < 12; i++ )); do
+        w=$(( ${#keys[i]} + 1 + ${#labels[i]} + ${#badge[i]} + ( ${#badge[i]} > 0 ? 1 : 0 ) + 2 ))
+        case $(( i % 3 )) in
+            0) [ "$w" -gt "$cols_w0" ] && cols_w0=$w ;;
+            1) [ "$w" -gt "$cols_w1" ] && cols_w1=$w ;;
+            2) [ "$w" -gt "$cols_w2" ] && cols_w2=$w ;;
+        esac
+    done
+    gl=9
+    [ $(( gl + cols_w0 + cols_w1 + cols_w2 + 3 * gap + 2 )) -gt "$COLS" ] && gl=0
+
+    echo
+    printf '  %s←↑↓→ move · Enter choose · or press the number / letter · q leaves%s\n' "$DIM" "$NC"
+    printf '\e[?25l'
+    local first=1
     while true; do
-        load_release
-        printf '\e[2J\e[H'
-        render_dashboard_compact
-        menu_select c "$c" \
-            "Live view|The dashboard, refreshing every 3 seconds" \
-            "LUN & connection|Target, login, session details, disks" \
-            "Storage & datastore|Free space, datastores, open tasks" \
-            "Health check|Full check including a test write (pbs-post-install.sh --status)" \
-            "Check & repair now|Runs the monitor once - repairs a lost connection" \
-            "Monitor log|The last events from the iSCSI monitor" \
-            "Services|Status of PBS, iSCSI and cron - restart PBS" \
-            "System updates|Check for updates and install them - advises a reboot after kernel updates" \
-            "Installer update|Newer version of this installer / login screen on GitHub$( [ "$REL_NEW" -eq 1 ] && echo " - v${REL_LATEST} IS AVAILABLE" )" \
-            "Help · key commands|The commands you will need" \
-            "Settings|Choose what happens at login" \
-            "Back to the shell"
-        [ "$c" -lt 0 ] && break
-        printf '\e[2J\e[H'
+        [ "$first" -eq 0 ] && printf '\e[6A'
+        first=0
+        for (( r = 0; r < 4; r++ )); do
+            printf '\r\e[K  '
+            [ "$gl" -gt 0 ] && printf '%s%-*s%s' "$DIM" "$gl" "${groups[r]}" "$NC"
+            for (( c = 0; c < 3; c++ )); do
+                i=$(( r * 3 + c ))
+                txt="${keys[i]} ${labels[i]}"
+                [ -n "${badge[i]}" ] && txt="${txt} ${badge[i]}"
+                case "$c" in 0) w=$cols_w0 ;; 1) w=$cols_w1 ;; *) w=$cols_w2 ;; esac
+                pad=$(( w - ${#txt} - 2 ))
+                if [ "$i" -eq "$sel" ]; then
+                    printf '\e[1;97;44m %s%*s \e[0m' "$txt" "$pad" ""
+                else
+                    cell=" ${CYAN}${keys[i]}${NC} ${labels[i]}"
+                    [ -n "${badge[i]}" ] && cell="${cell} ${bcol[i]}${badge[i]}${NC}"
+                    printf '%s%*s ' "$cell" "$pad" ""
+                fi
+                printf '%*s' "$gap" ""
+            done
+            printf '\n'
+        done
+        printf '\r\e[K\n\r\e[K  %s%s%s\n' "$DIM" "$(trunc "${hints[sel]}" $(( COLS - 4 )))" "$NC"
+        k=""
+        IFS= read -rsn1 k
+        rc=$?
+        [ "$rc" -ne 0 ] && { sel=11; break; }
+        if [ "$k" = $'\e' ]; then
+            rest=""
+            IFS= read -rsn2 -t 0.05 rest || true
+            case "$rest" in
+                '[A'|'OA') sel=$(( (sel + 9) % 12 )) ;;
+                '[B'|'OB') sel=$(( (sel + 3) % 12 )) ;;
+                '[C'|'OC') sel=$(( sel / 3 * 3 + (sel % 3 + 1) % 3 )) ;;
+                '[D'|'OD') sel=$(( sel / 3 * 3 + (sel % 3 + 2) % 3 )) ;;
+                '')        sel=11; break ;;
+            esac
+            continue
+        fi
+        if [ -z "$k" ]; then break; fi                       # Enter
+        for (( i = 0; i < 12; i++ )); do
+            if [ "${k,,}" = "${keys[i]}" ]; then sel=$i; break 2; fi
+        done
+    done
+    printf '\e[?25h'
+    GRID_SEL=$sel
+}
+
+menu_main() {
+    local c=0
+    need_root || exit 1
+    trap term_reset EXIT
+    trap 'term_reset; exit 0' INT TERM
+    while true; do
+        frame_open
+        menu_cards
+        menu_grid "$c"
+        c=$GRID_SEL
+        clear_body
         case "$c" in
             0) screen_watch; continue ;;
             1) screen_lun
@@ -4081,32 +4295,9 @@ menu_main() {
         esac
         press_key
     done
+    frame_close
     printf '\e[2J\e[H'
-}
-
-# A short header for the menu: logo-less, with the status pill
-render_dashboard_compact() {
-    local pill
-    IP=$(hostname -I 2>/dev/null | awk '{print $1}')
-    PROBLEMS=0; WARNINGS=0
-    gather_sessions
-    local s MOUNT_PATH TARGET src avail
-    echo
-    echo "  ${WHITE}PBS menu${NC}  ${DIM}$(hostname -s) · ${IP} · v${PBS_MOTD_VERSION:-?}${NC}"
-    printf '  %s%s%s\n' "$CYAN" "$(printf '━%.0s' $(seq 1 $(( COLS > 66 ? 64 : COLS - 4 ))))" "$NC"
-    while read -r -u 3 s; do
-        [ -z "$s" ] && continue
-        MOUNT_PATH=""; TARGET=""
-        # shellcheck disable=SC1090
-        source <(grep -E '^(TARGET|MOUNT_PATH)=' "$s")
-        src=$(findmnt -rn -M "$MOUNT_PATH" -o SOURCE 2>/dev/null)
-        avail=$(timeout 3 df -B1 --output=avail "$MOUNT_PATH" 2>/dev/null | tail -n 1 | tr -d ' ')
-        if [ -n "$src" ] && grep -qF "$TARGET" <<< "$SESS1"; then
-            echo "  ${GREEN}●${NC} ${MOUNT_PATH}  ${DIM}connected · $(hb "${avail:-0}") free${NC}"
-        else
-            echo "  ${RED}●${NC} ${MOUNT_PATH}  ${RED}not connected or not mounted${NC}"
-        fi
-    done 3< <(mon_scripts)
+    trap - INT TERM
 }
 
 # A small terminal (the Proxmox console is 80x25) cannot show everything at once. The panels are
@@ -4159,8 +4350,8 @@ cockpit() {
         render_dashboard; return 0
     fi
     SLIM=0
-    trap 'printf "\e[?25h"' EXIT
-    trap 'printf "\e[?25h\n"; exit 0' INT TERM
+    trap term_reset EXIT
+    trap 'term_reset; printf "\n"; exit 0' INT TERM
     printf '\e[?25l\e[2J'
     while true; do
         COLS=$(term_cols)
@@ -4195,6 +4386,7 @@ cockpit() {
         [ -n "$alerts" ] && bar="${alerts}"$'\e[K\n'"${bar}"
         hint="${DIM}live · every ${REFRESH_SECS}s · $(date '+%H:%M:%S')"
         [ "$PAGES" -gt 1 ] && hint="${hint} · page $(( PAGE + 1 ))/${PAGES}"
+        # shellcheck disable=SC2001
         printf '\e[H%s\n' "$(sed 's/$/\x1b[K/' <<< "$out")"
         printf '\e[K\n%s\e[K\n  %s%s\e[K\e[J' "$bar" "$hint" "$NC"
         k=""
@@ -4246,7 +4438,7 @@ cockpit() {
 # showing red lines. After 6 s the monitor is started once, the same thing cron does every
 # minute (it never runs twice at once and only repairs what is broken).
 wait_for_storage() {
-    local s i=0 ready kicked=0 sp='|/-\' TARGET MOUNT_PATH sess shown=0
+    local s i=0 ready kicked=0 sp="|/-\\" TARGET MOUNT_PATH sess shown=0
     [ "$(uptime_secs)" -ge 600 ] && return 0
     [ "$(id -u)" -eq 0 ] || return 0
     while [ "$i" -lt 25 ]; do
@@ -4816,7 +5008,7 @@ status_one() {
         fi
 
         # --- space ---
-        read -r size used avail < <(timeout 15 df -B1 --output=size,used,avail "$MOUNT_PATH" 2>/dev/null | tail -n 1) || true
+        read -r size used _ < <(timeout 15 df -B1 --output=size,used,avail "$MOUNT_PATH" 2>/dev/null | tail -n 1) || true
         if [[ "${size:-}" =~ ^[0-9]+$ && "$size" -gt 0 ]]; then
             pct=$(( used * 100 / size ))
             used_h=$(numfmt --to=iec --suffix=B "$used" 2>/dev/null || echo "$used")
