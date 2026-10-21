@@ -7,7 +7,7 @@
 # 
 # Thanks to Derek Seaman's Tech Blog who inspired me to make this.
 #
-# Version 1.9.2  21/10-2026
+# Version 1.9.3  21/10-2026
 # Author MorphyDK
 #
 # Usage:  ./pbs-post-install.sh              interactive installer
@@ -17,6 +17,11 @@
 #         ./pbs-post-install.sh --motd-remove  remove the login screen again
 #         ./pbs-post-install.sh --motd-update  silent update of the login screen, keeps settings
 #         ./pbs-post-install.sh --help
+#
+# Changes in 1.9.3:
+#  - Fixed: in pbs-menu, a long screen (LUN & connection with two drives, the health check, the
+#    monitor log, help) was cut off at the top - the first drive was missing. Long screens are now
+#    shown page by page below the frozen header (space = next, b = back, q = done)
 #
 # Changes in 1.9.2:
 #  - The menu (pbs-menu) has a new look: the logo and the status pill stay FROZEN at the top
@@ -136,7 +141,7 @@
 set -eE
 export LC_ALL=C.UTF-8
 
-VERSION="1.9.2"
+VERSION="1.9.3"
 LOG_FILE="/var/log/pbs-post-install.log"
 FS_LABEL="pbs-data"
 FOUR_TIB=4398046511104
@@ -3831,7 +3836,12 @@ screen_storage() {
 
 screen_health() {
     if [ -x "$INSTALLER" ]; then
-        "$INSTALLER" --status
+        if command -v script >/dev/null 2>&1; then
+            # a pseudo terminal, so the colours survive when the output is captured for paging
+            script -qec "$INSTALLER --status" /dev/null | tr -d '\r'
+        else
+            "$INSTALLER" --status
+        fi
     else
         echo "  ${YELLOW}The installer copy (${INSTALLER}) was not found, so the full health check is not available.${NC}"
         echo "  ${DIM}Run the installer again, or use the dashboard.${NC}"
@@ -4144,6 +4154,59 @@ frame_close() {
     FRAME=0
 }
 
+# A screen that is taller than the space below the frozen header is shown page by page
+# (lines that scroll off the top of a scroll region are gone, so nothing may scroll off).
+page_file() {   # page_file FILE
+    local f="$1" total per rows k rest i=0 end
+    rows=$(tput lines 2>/dev/null || echo 24)
+    case "$rows" in ''|*[!0-9]*) rows=24 ;; esac
+    per=$(( rows - HDR_H - 4 ))
+    [ "$per" -lt 6 ] && per=6
+    total=$(wc -l < "$f")
+    if [ "$total" -le "$per" ]; then
+        cat "$f"
+        return 0
+    fi
+    printf '\e[?25l'
+    while true; do
+        clear_body
+        end=$(( i + per ))
+        [ "$end" -gt "$total" ] && end=$total
+        [ $(( total - end )) -le 2 ] && end=$total        # no page of one or two stray lines
+        sed -n "$(( i + 1 )),${end}p" "$f"
+        printf '\n  %s── lines %d-%d of %d · space/↓ next · b/↑ back · q done ──%s' "$DIM" $(( i + 1 )) "$end" "$total" "$NC"
+        IFS= read -rsn1 k || break
+        if [ "$k" = $'\e' ]; then
+            rest=""
+            IFS= read -rsn2 -t 0.05 rest || true
+            case "$rest" in
+                '[B'|'OB') k=" " ;;
+                '[A'|'OA') k="b" ;;
+                '[6')      k=" "; IFS= read -rsn1 -t 0.05 _ || true ;;
+                '[5')      k="b"; IFS= read -rsn1 -t 0.05 _ || true ;;
+                *)         k="q" ;;
+            esac
+        fi
+        case "$k" in
+            q|Q) break ;;
+            b|B|k) i=$(( i - per )); [ "$i" -lt 0 ] && i=0 ;;
+            *)  if [ "$end" -ge "$total" ]; then break; fi      # space / Enter / n / j: next page, past the end = done
+                i=$(( i + per )) ;;
+        esac
+    done
+    printf '\r\e[K\e[?25h\n'
+}
+
+page_run() {   # page_run COMMAND [ARGS] - run it, show the output (paged when it is long)
+    local tmp
+    tmp=$(mktemp) || { "$@"; return 0; }
+    printf '  %sCollecting…%s' "$DIM" "$NC"
+    "$@" > "$tmp" 2>&1
+    printf '\r\e[K'
+    page_file "$tmp"
+    rm -f "$tmp"
+}
+
 menu_cards() {   # one small drive icon + status per LUN
     local i n=${#DRV_NAME[@]} col status info prov
     if [ "$n" -eq 0 ]; then
@@ -4277,19 +4340,19 @@ menu_main() {
         clear_body
         case "$c" in
             0) screen_watch; continue ;;
-            1) screen_lun
+            1) page_run screen_lun
                if [ -x "$INSTALLER" ] && ask_yn "Type the CHAP login again (fix a rejected login)?"; then
                    "$INSTALLER" --fix-login
                fi ;;
-            2) screen_storage ;;
-            3) screen_health ;;
+            2) page_run screen_storage ;;
+            3) page_run screen_health ;;
             4) screen_repair ;;
-            5) screen_log 40 ;;
+            5) page_run screen_log 40 ;;
             6) screen_services; continue ;;
             7) do_update ;;
             8) installer_update
                if [ "$UPDATED" -eq 1 ]; then press_key; exec /usr/local/sbin/pbs-motd --menu; fi ;;
-            9) render_help ;;
+            9) page_run render_help ;;
             10) screen_settings; continue ;;
             *) break ;;
         esac
