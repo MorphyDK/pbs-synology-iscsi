@@ -7,7 +7,7 @@
 # 
 # Thanks to Derek Seaman's Tech Blog who inspired me to make this.
 #
-# Version 1.10.1  26/10-2026
+# Version 1.10.2  26/10-2026
 # Author MorphyDK
 #
 # Usage:  ./pbs-post-install.sh              interactive installer
@@ -19,6 +19,10 @@
 #         ./pbs-post-install.sh --motd-remove  remove the login screen again
 #         ./pbs-post-install.sh --motd-update  silent update of the login screen, keeps settings
 #         ./pbs-post-install.sh --help
+#
+# Changes in 1.10.2:
+#  - ShellCheck: the "unreachable" notes in the login screen are now really silenced (the
+#    directive was placed after the first command in 1.10.1, where it did not cover the file)
 #
 # Changes in 1.10.1:
 #  - ShellCheck clean-up: one unused variable in --status removed, and the login screen tells
@@ -162,7 +166,7 @@
 set -eE
 export LC_ALL=C.UTF-8
 
-VERSION="1.10.1"
+VERSION="1.10.2"
 LOG_FILE="/var/log/pbs-post-install.log"
 FS_LABEL="pbs-data"
 FOUR_TIB=4398046511104
@@ -2888,10 +2892,11 @@ write_motd_script() {
     local dest="$1"
     {
         echo '#!/bin/bash'
+        # before the first command, so it covers the whole file: the screens are started
+        # indirectly (page_run screen_lun), which ShellCheck reads as "unreachable"
+        echo '# shellcheck disable=SC2317'
         printf 'PBS_MOTD_VERSION=%q\n' "$VERSION"
         cat <<'MOTD_EOF'
-# The screens are started indirectly (page_run screen_lun), so ShellCheck sees them as unreachable.
-# shellcheck disable=SC2317
 # pbs-motd - login dashboard, live view and menu for Proxmox Backup Server.
 # Written by pbs-post-install. Read-only: it never changes storage by itself.
 #   pbs-motd              show the dashboard
