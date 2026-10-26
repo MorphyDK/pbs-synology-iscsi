@@ -587,7 +587,7 @@ Released under the **MIT License**. Use it at your own risk. Always keep a secon
 
 *This is an independent community project. It is not affiliated with or endorsed by Proxmox Server Solutions GmbH or Synology Inc. Proxmox, Proxmox Backup Server and Synology are trademarks of their respective owners.*
 
-Found a security problem? See [SECURITY.md](SECURITY.md).
+Found a security problem? See [SECURITY.MD](SECURITY.MD).
 
 <div align="center">
 
