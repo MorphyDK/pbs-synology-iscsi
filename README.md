@@ -8,7 +8,7 @@
 
 *Plain shell menus · CHAP · ext4 or XFS · keeps your data · repairs itself · live login dashboard · one-key self-update*
 
-![version](https://img.shields.io/badge/version-1.10.0-2f81f7?style=for-the-badge)
+![version](https://img.shields.io/badge/version-1.10.1-2f81f7?style=for-the-badge)
 ![debian](https://img.shields.io/badge/Debian-13%20trixie-d70a53?style=for-the-badge&logo=debian&logoColor=white)
 ![pbs](https://img.shields.io/badge/Proxmox%20Backup%20Server-4.x-e57000?style=for-the-badge)
 ![bash](https://img.shields.io/badge/Bash-5.x-4eaa25?style=for-the-badge&logo=gnubash&logoColor=white)
@@ -93,7 +93,7 @@ This script walks you through the whole setup with questions first and changes s
    ██████╔╝██████╔╝███████╗   Proxmox Backup Server  4.2.8
    ██╔═══╝ ██╔══██╗╚════██║   iSCSI storage on Synology
    ██║     ██████╔╝███████║   ● ALL SYSTEMS HEALTHY
-   ╚═╝     ╚═════╝ ╚══════╝   pbs-motd v1.10.0 · by MorphyDK
+   ╚═╝     ╚═════╝ ╚══════╝   pbs-motd v1.10.1 · by MorphyDK
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   ╭─ Server
@@ -103,7 +103,7 @@ This script walks you through the whole setup with questions first and changes s
   │ System disk    ████░░░░░░░░░░░░░░░░░░░░  17%  4.8GB of 28GB
   │ Updates        ✔ up to date (checked 5h ago)
   │ Reboot         (shown in red when a newer kernel is installed than the one running)
-  │ Installer      ✔ v1.10.0 · newest version (checked 3h ago)
+  │ Installer      ✔ v1.10.1 · newest version (checked 3h ago)
   ╰─
 
   ╭─ iSCSI storage · /mnt/synology
@@ -151,7 +151,7 @@ The questions take about two minutes. After the review screen the installer runs
 
 **Requirements**
 
-| | |
+| Item | Needs |
 |---|---|
 | Server | Proxmox Backup Server **4.x on Debian 13 "trixie"** (developed and tested on PBS 4.2). Older versions are untested, and re-attaching an existing datastore needs PBS 3.3 or newer |
 | NAS | Synology with DSM 7 and **SAN Manager** (iSCSI) |
@@ -242,7 +242,7 @@ Both are fully supported for PBS datastores. PBS stores backups as many small ch
 |---|---|---|
 | Good for | The proven Linux default, easy to repair | Big volumes and millions of files |
 | Grow later | Yes | Yes (never shrink) |
-| Created with | 0 % reserved blocks (`-m 0`), so the whole LUN is usable | defaults |
+| Created with | 0% reserved blocks (`-m 0`), so the whole LUN is usable | defaults |
 | Recommended | Under 4 TiB | **4 TiB and larger** |
 
 ---
@@ -295,7 +295,7 @@ In the **live dashboard** a key bar at the bottom shows what you can do: `m` men
    ██████╗ ██████╗ ███████╗   pbs  192.168.0.57
    ██╔══██╗██╔══██╗██╔════╝   Proxmox Backup Server  4.2.8
    ██████╔╝██████╔╝███████╗   ● ALL SYSTEMS HEALTHY
-   ╚═╝     ╚═════╝ ╚══════╝   pbs-motd v1.10.0 · by MorphyDK
+   ╚═╝     ╚═════╝ ╚══════╝   pbs-motd v1.10.1 · by MorphyDK
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   ▄▄▄  synology-Thick  thick · ext4 · 20GB   ● connected
   █●█  █░░░░░░░░░░░░░░░░░░░░░░░░░░░   1%  20GB free
@@ -497,7 +497,7 @@ The apt hook re-applies the patch after every package change. If a PBS update ch
 <details>
 <summary><b>Where are the logs?</b></summary>
 
-| | |
+| Log | Where |
 |---|---|
 | Installer | `/var/log/pbs-post-install.log` |
 | Monitor | `/var/log/iscsi-monitor.log` |
@@ -538,7 +538,7 @@ It is written for Synology (the guide, the CHAP limits, the IQN style). Any iSCS
 ./pbs-post-install.sh --motd-remove                   # login screen
 
 # monitor + boot order (replace <name> with your mount directory name, e.g. synology)
-crontab -l | grep -v "iSCSI monitor for <name>" | crontab -
+crontab -l | grep -v "# iSCSI monitor for <name>$" | crontab -
 rm /usr/local/bin/check-iscsi-session-<name>.sh /etc/pbs-iscsi-monitor-<name>.conf
 rm /etc/systemd/system/proxmox-backup{,-proxy}.service.d/10-iscsi-<name>.conf && systemctl daemon-reload
 
@@ -561,13 +561,11 @@ The datastore itself is removed in the PBS web UI (Datastore › Remove). That d
 
 **Developed and run against:** Proxmox Backup Server 4.2.x on Debian 13 (trixie), a Synology NAS over iSCSI with CHAP, one thin and one thick LUN (ext4), with TRIM and the login dashboard on two drives.
 
-**Tested with a simulated GitHub:** the update (download, check, save, install, test), the automatic rollback when the new version fails, a file with the wrong version or a syntax error (refused), no network, auto-install, and `--rollback`. **Not yet run against the real GitHub release page**, so the first real update is the real test.
-
-**Drives menu (v1.10.0):** *Remove a drive* was run against simulated tools: a normal removal, a running task (refused), PBS refusing the datastore removal, a drive that is busy, and two drives on one target. *Add a drive* reuses the installer's tested setup. **Neither has been run against a real Synology yet**, so try *Remove a drive* first on a drive you can afford to lose.
+**Run on real hardware (v1.10.x):** the self-update from GitHub (v1.9.1 → v1.9.2 → v1.9.3 → v1.10.0, press `i`), *Remove a drive* and *Add a drive* on a Synology. The rollback after a failed update, a file with the wrong version or a syntax error (refused), no network, auto-install and `--rollback` were tested against a simulated GitHub only. *Remove a drive* was also run against simulated tools for the edge cases: a running task (refused), PBS refusing the datastore removal, a busy drive, and two drives on one target.
 
 **Not yet verified on real hardware:** what happens through a full DSM update/reboot with a backup running, the automatic repair after a long outage, and XFS on very large LUNs. **Please test restores before you rely on any backup setup**, and open an issue if something behaves differently on your system.
 
-Checked with `shellcheck` (the installer, the generated login screen and the monitor script): no errors. The few remaining notes were tidied in v1.9.2.
+`shellcheck` was run on the installer, the generated login screen and the monitor script. Remaining notes in v1.10.0 (one unused variable, "unreachable" notes for screens started through the pager) were fixed in v1.10.1; the monitor script of a drive set up with an older version keeps its old text until you run the installer for that drive again. Not yet re-run after v1.10.1.
 
 ---
 
@@ -586,6 +584,10 @@ Checked with `shellcheck` (the installer, the generated login screen and the mon
 - Written by **MorphyDK**, with the help of Claude.
 
 Released under the **MIT License**. Use it at your own risk. Always keep a second copy of data that matters.
+
+*This is an independent community project. It is not affiliated with or endorsed by Proxmox Server Solutions GmbH or Synology Inc. Proxmox, Proxmox Backup Server and Synology are trademarks of their respective owners.*
+
+Found a security problem? See [SECURITY.md](SECURITY.md).
 
 <div align="center">
 

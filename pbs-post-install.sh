@@ -7,7 +7,7 @@
 # 
 # Thanks to Derek Seaman's Tech Blog who inspired me to make this.
 #
-# Version 1.10.0  21/10-2026
+# Version 1.10.1  26/10-2026
 # Author MorphyDK
 #
 # Usage:  ./pbs-post-install.sh              interactive installer
@@ -19,6 +19,11 @@
 #         ./pbs-post-install.sh --motd-remove  remove the login screen again
 #         ./pbs-post-install.sh --motd-update  silent update of the login screen, keeps settings
 #         ./pbs-post-install.sh --help
+#
+# Changes in 1.10.1:
+#  - ShellCheck clean-up: one unused variable in --status removed, and the login screen tells
+#    ShellCheck that its screens are started through the pager (no more "unreachable" notes).
+#    No change in behaviour
 #
 # Changes in 1.10.0:
 #  - New: Drives submenu in pbs-menu (item 2): Drive details, Add a drive, Change the CHAP login,
@@ -157,7 +162,7 @@
 set -eE
 export LC_ALL=C.UTF-8
 
-VERSION="1.10.0"
+VERSION="1.10.1"
 LOG_FILE="/var/log/pbs-post-install.log"
 FS_LABEL="pbs-data"
 FOUR_TIB=4398046511104
@@ -2885,6 +2890,8 @@ write_motd_script() {
         echo '#!/bin/bash'
         printf 'PBS_MOTD_VERSION=%q\n' "$VERSION"
         cat <<'MOTD_EOF'
+# The screens are started indirectly (page_run screen_lun), so ShellCheck sees them as unreachable.
+# shellcheck disable=SC2317
 # pbs-motd - login dashboard, live view and menu for Proxmox Backup Server.
 # Written by pbs-post-install. Read-only: it never changes storage by itself.
 #   pbs-motd              show the dashboard
@@ -5061,7 +5068,7 @@ status_write_test() {
 status_one() {
     local script="$1" TARGET="" PORTAL="" MOUNT_PATH=""
     local service_name src fstype opts disk disc state sid rt live rt_show
-    local size used avail pct used_h size_h ds rc cutoff events last_line conf mode drop sess_up auth prov
+    local size used pct used_h size_h ds rc cutoff events last_line conf mode drop sess_up auth prov
 
     # shellcheck disable=SC1090
     source <(grep -E '^(TARGET|PORTAL|MOUNT_PATH)=' "$script" || true)
