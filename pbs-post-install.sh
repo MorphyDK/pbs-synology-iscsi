@@ -7,7 +7,7 @@
 # 
 # Thanks to Derek Seaman's Tech Blog who inspired me to make this.
 #
-# Version 1.10.2  26/10-2026
+# Version 1.10.3  26/10-2026
 # Author MorphyDK
 #
 # Usage:  ./pbs-post-install.sh              interactive installer
@@ -19,6 +19,10 @@
 #         ./pbs-post-install.sh --motd-remove  remove the login screen again
 #         ./pbs-post-install.sh --motd-update  silent update of the login screen, keeps settings
 #         ./pbs-post-install.sh --help
+#
+# Changes in 1.10.3:
+#  - The message shown when the installer is piped no longer suggests running it straight from
+#    curl. Download, read, then run. No other change in behaviour
 #
 # Changes in 1.10.2:
 #  - ShellCheck: the "unreachable" notes in the login screen are now really silenced (the
@@ -166,7 +170,7 @@
 set -eE
 export LC_ALL=C.UTF-8
 
-VERSION="1.10.2"
+VERSION="1.10.3"
 LOG_FILE="/var/log/pbs-post-install.log"
 FS_LABEL="pbs-data"
 FOUR_TIB=4398046511104
@@ -1467,7 +1471,7 @@ preflight() {
     fi
     if [[ ! -t 0 || ! -t 1 ]]; then
         echo "This installer is interactive - run it directly in a terminal (not piped)." >&2
-        echo "Download it first, or use:  bash <(curl -fsSL <script-url>)" >&2
+        echo "Download the file first, read it, then run it from a terminal: ./pbs-post-install.sh" >&2
         exit 1
     fi
     touch "$LOG_FILE"
