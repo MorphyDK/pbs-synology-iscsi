@@ -7,7 +7,7 @@
 # 
 # Thanks to Derek Seaman's Tech Blog who inspired me to make this.
 #
-# Version 1.12.0  27/10-2026
+# Version 1.12.1  27/10-2026
 # Author MorphyDK
 #
 # Usage:  ./pbs-post-install.sh              interactive installer
@@ -21,6 +21,14 @@
 #         ./pbs-post-install.sh --motd-remove  remove the login screen again
 #         ./pbs-post-install.sh --motd-update  silent update of the login screen, keeps settings
 #         ./pbs-post-install.sh --help
+#
+# Changes in 1.12.1:
+#  - The installer now refuses a mount path that already belongs to another drive (another target
+#    or a registered datastore) - before it could overwrite that drive's mount, monitor and fstab line
+#  - A datastore path that overlaps an existing datastore is refused while you answer the questions,
+#    instead of failing at the end after the disk was formatted (PBS: "nested datastores not allowed")
+#  - A manually typed target IQN is checked for the iqn./eui./naa. format right away
+#  - --dry-run plan says "save the CHAP login" for a new login and "keep" only for a stored one
 #
 # Changes in 1.12.0:
 #  - --dry-run now works with the installer, --add-drive and --remove-drive too (and --uninstall).
@@ -189,7 +197,7 @@
 set -eE
 export LC_ALL=C.UTF-8
 
-VERSION="1.12.0"
+VERSION="1.12.1"
 LOG_FILE="/var/log/pbs-post-install.log"
 FS_LABEL="pbs-data"
 FOUR_TIB=4398046511104
@@ -1474,6 +1482,12 @@ reuse_supported() {
     [[ $REUSE_OK -eq 1 ]]
 }
 
+ds_overlapping() {   # ds_overlapping PATH -> names of datastores that are the same folder, inside it or around it
+    awk -v p="$1" '
+        /^datastore:/ { name = $2 }
+        $1 == "path" && ($2 == p || index($2, p "/") == 1 || index(p, $2 "/") == 1) { print name }
+    ' "$DS_CFG" 2>/dev/null || true
+}
 ds_exists() {
     proxmox-backup-manager datastore show "$1" >/dev/null 2>&1
 }
@@ -1770,7 +1784,13 @@ choose_target() {
     echo "  ${WHITE}Which target holds the backup LUN?${NC}"
     menu_select choice "$sel" "${items[@]}"
     if [[ $choice -eq ${#DISCOVERED_TARGETS[@]} ]]; then
-        ask_required TARGET_IQN "Target IQN" "e.g. iqn.2000-01.com.synology:DS923.Target-1.2c0d1f17e14" "$TARGET_IQN"
+        while true; do
+            ask_required TARGET_IQN "Target IQN" "e.g. iqn.2000-01.com.synology:DS923.Target-1.2c0d1f17e14" "$TARGET_IQN"
+            if [[ "$TARGET_IQN" =~ ^(iqn\.[0-9]{4}-[0-9]{2}\.[^[:space:]]+|eui\.[0-9A-Fa-f]+|naa\.[0-9A-Fa-f]+)$ ]]; then
+                break
+            fi
+            err "That is not an iSCSI name. It starts with iqn. followed by a year and month, like iqn.2000-01.com.synology:..."
+        done
     else
         TARGET_IQN="${DISCOVERED_TARGETS[choice]}"
     fi
@@ -2026,7 +2046,7 @@ setup_lun() {
 }
 
 ask_mount_path() {
-    local src
+    local src old_script old_target old_ds
     while true; do
         echo
         ask_required MOUNT_PATH "Mount path" "where the LUN is mounted on this server" "${MOUNT_PATH:-/mnt/synology}"
@@ -2056,6 +2076,18 @@ ask_mount_path() {
             err "A drive called '$(basename "$MOUNT_PATH")' is already set up - choose a different last part of the path."
             continue
         fi
+        old_script="/usr/local/bin/check-iscsi-session-$(basename "$MOUNT_PATH").sh"
+        old_target=""
+        if [[ -f "$old_script" ]]; then
+            old_target=$(awk -F= '/^TARGET=/ { print $2; exit }' "$old_script" | tr -d "\"'")
+        fi
+        old_ds=$(datastores_on "$MOUNT_PATH" | paste -sd' ' - || true)
+        if [[ -n "$old_target" && "$old_target" != "${TARGET_IQN:-}" ]] || [[ -z "$old_target" && -n "$old_ds" ]]; then
+            err "${MOUNT_PATH} already belongs to another drive${old_target:+ (target ${old_target##*:})}${old_ds:+, datastore ${old_ds}}."
+            echo "    ${DIM}Installing here would overwrite that drive's mount, monitor and datastore path.${NC}"
+            echo "    ${DIM}Choose a different path, or remove the old drive first: pbs-post-install.sh --remove-drive${NC}"
+            continue
+        fi
         if awk -v p="$MOUNT_PATH" '!/^[[:space:]]*#/ && $2 == p { f = 1 } END { exit !f }' /etc/fstab; then
             warn "/etc/fstab already has an entry for ${MOUNT_PATH} - it will be replaced (a backup is kept)."
         fi
@@ -2065,7 +2097,7 @@ ask_mount_path() {
 }
 
 setup_datastore_questions() {
-    local default_path="" choice
+    local default_path="" choice clash
     DS_REUSE=0
     DS_SKIP=0
     echo
@@ -2111,6 +2143,11 @@ setup_datastore_questions() {
     done
 
     if [[ $DS_REUSE -eq 1 ]]; then
+        clash=$(ds_overlapping "$DS_PATH" | paste -sd' ' - || true)
+        if [[ -n "$clash" ]]; then
+            warn "${DS_PATH} is already used by the datastore ${clash} - it is left as it is and no new datastore is added."
+            DS_SKIP=1
+        fi
         return 0
     fi
 
@@ -2121,10 +2158,17 @@ setup_datastore_questions() {
                 DS_PATH="$default_path"
             fi
             DS_PATH="${DS_PATH%/}"
-            if [[ "$DS_PATH" == "$MOUNT_PATH" || "$DS_PATH" == "$MOUNT_PATH"/* ]]; then
-                break
+            if [[ "$DS_PATH" != "$MOUNT_PATH" && "$DS_PATH" != "$MOUNT_PATH"/* ]]; then
+                err "The datastore path must be on the LUN (${MOUNT_PATH} or a folder below it)."
+                continue
             fi
-            err "The datastore path must be on the LUN (${MOUNT_PATH} or a folder below it)."
+            clash=$(ds_overlapping "$DS_PATH" | paste -sd' ' - || true)
+            if [[ -n "$clash" ]]; then
+                err "${DS_PATH} overlaps the datastore ${clash}. PBS does not allow datastores inside each other."
+                echo "    ${DIM}Choose another path, or remove that datastore first (pbs-post-install.sh --remove-drive).${NC}"
+                continue
+            fi
+            break
         done
     else
         while true; do
@@ -5831,7 +5875,11 @@ dry_run_plan() {
     if [[ $DO_ISCSI -eq 1 ]]; then
         P "set only this target to log in automatically at boot and wait up to $(( REPLACEMENT_TIMEOUT / 60 )) min for the NAS to come back"
         if [[ $CHAP_MODE -eq 1 ]]; then
-            P "keep the CHAP login for ${TARGET_IQN##*:} (user ${CHAP_USER}) in the root-only iSCSI node record; the password is never logged"
+            if [[ ${CHAP_KEEP:-0} -eq 1 ]]; then
+                P "keep the CHAP login already stored for ${TARGET_IQN##*:}"
+            else
+                P "save the CHAP login for ${TARGET_IQN##*:} (user ${CHAP_USER}) in the root-only iSCSI node record; the password is never logged"
+            fi
         fi
         P "log in to ${TARGET_IQN##*:} at ${PORTAL_IP}"
         case "$DISK_ACTION" in
