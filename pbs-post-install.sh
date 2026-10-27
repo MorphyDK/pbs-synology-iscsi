@@ -7,7 +7,7 @@
 # 
 # Thanks to Derek Seaman's Tech Blog who inspired me to make this.
 #
-# Version 1.10.3  26/10-2026
+# Version 1.10.4  27/10-2026
 # Author MorphyDK
 #
 # Usage:  ./pbs-post-install.sh              interactive installer
@@ -19,6 +19,10 @@
 #         ./pbs-post-install.sh --motd-remove  remove the login screen again
 #         ./pbs-post-install.sh --motd-update  silent update of the login screen, keeps settings
 #         ./pbs-post-install.sh --help
+#
+# Changes in 1.10.4:
+#  - Removing the "No valid subscription" popup is now opt-in: the option is OFF until you tick it
+#    in step 2 of the setup. An existing popup patch from an earlier install is left as it is
 #
 # Changes in 1.10.3:
 #  - The message shown when the installer is piped no longer suggests running it straight from
@@ -170,7 +174,7 @@
 set -eE
 export LC_ALL=C.UTF-8
 
-VERSION="1.10.3"
+VERSION="1.10.4"
 LOG_FILE="/var/log/pbs-post-install.log"
 FS_LABEL="pbs-data"
 FOUR_TIB=4398046511104
@@ -220,7 +224,7 @@ DO_REPO=1
 DO_UPGRADE=1
 DO_ISCSI=1
 DO_DS=1
-DO_NAG=1
+DO_NAG=0              # off by default: hiding the subscription popup is opt-in
 DO_MOTD=1
 ADD_DRIVE=0          # 1 = --add-drive: only connect another drive (no repo/upgrade/popup/login-screen steps)
 MOTD_MODE="prompt"   # prompt | dashboard | live
@@ -1537,7 +1541,7 @@ setup_welcome() {
 setup_options() {
     while true; do
         render_setup 1
-        echo "  Choose what the installer should do. ${DIM}(all on = recommended for a fresh server)${NC}"
+        echo "  Choose what the installer should do. ${DIM}(the subscription popup removal is off until you tick it)${NC}"
         echo
         CL_LABELS=(
             "Switch to the no-subscription repository"
@@ -1552,7 +1556,7 @@ setup_options() {
             "Recommended on a fresh install - can take a few minutes"
             "Installs open-iscsi, connects, inspects and mounts the LUN"
             "Registers the storage in PBS so backups can be stored there"
-            "Hides the \"No valid subscription\" message at login - kept after updates"
+            "Optional, off by default: hides the \"No valid subscription\" message - please consider a subscription"
             "Live status when you log in: server, Synology link, free space, backups - plus a menu"
         )
         CL_STATE=("$DO_REPO" "$DO_UPGRADE" "$DO_ISCSI" "$DO_DS" "$DO_NAG" "$DO_MOTD")
@@ -2266,7 +2270,7 @@ setup_review() {
     else
         kv "Datastore" "no"
     fi
-    kv "Popup" "$( [[ $DO_NAG -eq 1 ]] && echo 'remove the subscription popup' || echo 'unchanged' )"
+    kv "Popup" "$( [[ $DO_NAG -eq 1 ]] && echo 'remove the subscription popup (you chose this)' || echo 'unchanged' )"
     kv "Login screen" "$( [[ $DO_MOTD -eq 1 ]] && case "$MOTD_MODE" in prompt) echo 'dashboard + menu prompt' ;; dashboard) echo 'dashboard only' ;; live) echo 'live dashboard (stays open until q)' ;; esac || echo 'unchanged' )"
     panel_bottom
     menu_select choice 0 \

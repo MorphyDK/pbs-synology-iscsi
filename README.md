@@ -8,7 +8,7 @@
 
 *Plain shell menus · CHAP · ext4 or XFS · keeps your data · repairs itself · live login dashboard · one-key self-update*
 
-![version](https://img.shields.io/badge/version-1.10.3-2f81f7?style=for-the-badge)
+![version](https://img.shields.io/badge/version-1.10.4-2f81f7?style=for-the-badge)
 ![debian](https://img.shields.io/badge/Debian-13%20trixie-d70a53?style=for-the-badge&logo=debian&logoColor=white)
 ![pbs](https://img.shields.io/badge/Proxmox%20Backup%20Server-4.x-e57000?style=for-the-badge)
 ![bash](https://img.shields.io/badge/Bash-5.x-4eaa25?style=for-the-badge&logo=gnubash&logoColor=white)
@@ -81,7 +81,7 @@ This script walks you through the whole setup with questions first and changes s
 
 - Switches from the enterprise repository (needs a subscription) to the free **no-subscription** repository, and runs the upgrade.
 - Creates the **PBS datastore** (or re-attaches an existing one).
-- Removes the **"No valid subscription"** popup, using the "NO NAG" method of the community-scripts post-pbs-install script.
+- **Optional, off by default:** removes the **"No valid subscription"** popup, using the "NO NAG" method of the community-scripts post-pbs-install script. You have to tick it in step 2 of the setup.
 
 ---
 
@@ -93,7 +93,7 @@ This script walks you through the whole setup with questions first and changes s
    ██████╔╝██████╔╝███████╗   Proxmox Backup Server  4.2.8
    ██╔═══╝ ██╔══██╗╚════██║   iSCSI storage on Synology
    ██║     ██████╔╝███████║   ● ALL SYSTEMS HEALTHY
-   ╚═╝     ╚═════╝ ╚══════╝   pbs-motd v1.10.3 · by MorphyDK
+   ╚═╝     ╚═════╝ ╚══════╝   pbs-motd v1.10.4 · by MorphyDK
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   ╭─ Server
@@ -103,7 +103,7 @@ This script walks you through the whole setup with questions first and changes s
   │ System disk    ████░░░░░░░░░░░░░░░░░░░░  17%  4.8GB of 28GB
   │ Updates        ✔ up to date (checked 5h ago)
   │ Reboot         (shown in red when a newer kernel is installed than the one running)
-  │ Installer      ✔ v1.10.3 · newest version (checked 3h ago)
+  │ Installer      ✔ v1.10.4 · newest version (checked 3h ago)
   ╰─
 
   ╭─ iSCSI storage · /mnt/synology
@@ -198,7 +198,7 @@ The installer shows this guide on screen too, but doing it first saves time.
 | # | Step | What happens |
 |---|---|---|
 | 1 | Welcome | Shows the server, PBS version and OS |
-| 2 | Options | Tick what you want: repository, upgrade, iSCSI, datastore, popup removal, login screen |
+| 2 | Options | Tick what you want: repository, upgrade, iSCSI, datastore, login screen, and (off by default) popup removal |
 | 3 | iSCSI tools | Installs `open-iscsi`, `parted`, `xfsprogs`. Touches no disk |
 | 4 | Synology guide | Thin vs thick, target, CHAP, access |
 | 5 | Connection | Enter the Synology address, pick the target from a list, enter the CHAP login (tested immediately) |
@@ -217,7 +217,7 @@ The installer shows this guide on screen too, but doing it first saves time.
 | 5 | Mount via `/etc/fstab` | UUID-based line with `_netdev,nofail,x-systemd.device-timeout=30` |
 | 6 | Monitoring & boot order | Monitor script + cron, logrotate, systemd drop-ins for PBS, TRIM, alerts |
 | 7 | PBS datastore | Creates the datastore, or re-attaches the existing one |
-| 8 | Subscription popup | Applies the "NO NAG" patch |
+| 8 | Subscription popup | Only if you ticked it: applies the "NO NAG" patch |
 | 9 | Login screen | Dashboard, menu and help |
 | 10 | Finish | Summary, next steps, optional reboot |
 
@@ -295,7 +295,7 @@ In the **live dashboard** a key bar at the bottom shows what you can do: `m` men
    ██████╗ ██████╗ ███████╗   pbs  192.168.0.57
    ██╔══██╗██╔══██╗██╔════╝   Proxmox Backup Server  4.2.8
    ██████╔╝██████╔╝███████╗   ● ALL SYSTEMS HEALTHY
-   ╚═╝     ╚═════╝ ╚══════╝   pbs-motd v1.10.3 · by MorphyDK
+   ╚═╝     ╚═════╝ ╚══════╝   pbs-motd v1.10.4 · by MorphyDK
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   ▄▄▄  synology-Thick  thick · ext4 · 20GB   ● connected
   █●█  █░░░░░░░░░░░░░░░░░░░░░░░░░░░   1%  20GB free
@@ -418,7 +418,7 @@ It prints plain text when piped, so it works in cron:
 | `/etc/pbs-iscsi-monitor-<name>.conf` | Alert settings, mode 600 |
 | `/var/log/iscsi-monitor.log` | Monitor log. Rotated weekly, 8 weeks (`/etc/logrotate.d/pbs-iscsi-monitor`) |
 | `/etc/systemd/system/proxmox-backup{,-proxy}.service.d/10-iscsi-<name>.conf` | PBS starts after the mount |
-| `/etc/apt/apt.conf.d/no-nag-script` | Subscription popup patch, re-applied after every update |
+| `/etc/apt/apt.conf.d/no-nag-script` | Subscription popup patch, only if you chose it. Re-applied after every update |
 | `/usr/local/sbin/pbs-motd` + `/usr/local/bin/pbs-{motd,menu,help}` | Login screen |
 | `/etc/profile.d/pbs-motd.sh`, `/etc/pbs-motd.conf`, `/etc/cron.d/pbs-motd` | Login hook, its settings, daily update count and installer check |
 | `/var/lib/pbs-motd/` | Update counts, the last installer check, the saved versions for `--rollback` |
@@ -538,13 +538,13 @@ Yes. It detects a mounted LUN, keeps a stored CHAP login, corrects an outdated `
 Yes. `--status`, the menu and the dashboard handle several installations. A target with several LUNs shows a picker.
 
 **Can I skip parts?**
-Yes. Step 2 of the setup lets you untick the repository switch, the upgrade, iSCSI, the datastore, the popup removal and the login screen.
+Yes. Step 2 of the setup lets you untick the repository switch, the upgrade, iSCSI, the datastore and the login screen. The popup removal is off unless you tick it.
 
 **Why not whiptail?**
 Plain shell menus are lighter, work over any SSH session, and look the same everywhere.
 
 **Is the popup removal OK?**
-It is the community-maintained approach, and it keeps the software working. If PBS is useful to you, please consider a subscription to support its developers.
+It is optional and off by default. It is the community-maintained approach, and it keeps the software working. If PBS is useful to you, please consider a subscription to support its developers.
 
 **Other NAS brands?**
 It is written for Synology (the guide, the CHAP limits, the IQN style). Any iSCSI target should work with the same commands, but only Synology is tested.
