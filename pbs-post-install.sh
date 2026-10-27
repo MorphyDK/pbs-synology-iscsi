@@ -7,7 +7,7 @@
 # 
 # Thanks to Derek Seaman's Tech Blog who inspired me to make this.
 #
-# Version 1.12.2  27/10-2026
+# Version 1.12.3  27/10-2026
 # Author MorphyDK
 #
 # Usage:  ./pbs-post-install.sh              interactive installer
@@ -21,6 +21,11 @@
 #         ./pbs-post-install.sh --motd-remove  remove the login screen again
 #         ./pbs-post-install.sh --motd-update  silent update of the login screen, keeps settings
 #         ./pbs-post-install.sh --help
+#
+# Changes in 1.12.3:
+#  - The installer now rescans the target's session before it lists the LUNs, so a LUN you mapped
+#    on the Synology after this server logged in (typically with --add-drive) shows up by itself.
+#    Before, it only rescanned when no disk was found at all
 #
 # Changes in 1.12.2:
 #  - --dry-run now also works on a fresh server without open-iscsi / parted / xfsprogs: it skips the
@@ -205,7 +210,7 @@
 set -eE
 export LC_ALL=C.UTF-8
 
-VERSION="1.12.2"
+VERSION="1.12.3"
 LOG_FILE="/var/log/pbs-post-install.log"
 FS_LABEL="pbs-data"
 FOUR_TIB=4398046511104
@@ -1154,6 +1159,13 @@ get_target_devices() {
 # Prints all of them, one per line (a target can hold several LUNs).
 wait_for_devices() {
     local devs d attempt rescanned=0 all_ready
+    # A LUN mapped on the Synology after this server logged in is only seen after a rescan:
+    # ask the target's session first, so --add-drive finds a LUN created a minute ago
+    if session_active; then
+        timeout 30 iscsiadm -m node -T "$TARGET_IQN" -p "$PORTAL_IP" --rescan >/dev/null 2>&1 || true
+        sleep 2
+        udevadm settle >/dev/null 2>&1 || true
+    fi
     for attempt in $(seq 1 20); do
         devs=$(get_target_devices)
         if [[ -n "$devs" ]]; then
