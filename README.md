@@ -8,7 +8,7 @@
 
 *Plain shell menus · CHAP · ext4 or XFS · keeps your data · repairs itself · live login dashboard · one-key self-update*
 
-![version](https://img.shields.io/badge/version-1.12.1-2f81f7?style=for-the-badge)
+![version](https://img.shields.io/badge/version-1.12.2-2f81f7?style=for-the-badge)
 ![debian](https://img.shields.io/badge/Debian-13%20trixie-d70a53?style=for-the-badge&logo=debian&logoColor=white)
 ![pbs](https://img.shields.io/badge/Proxmox%20Backup%20Server-4.x-e57000?style=for-the-badge)
 ![bash](https://img.shields.io/badge/Bash-5.x-4eaa25?style=for-the-badge&logo=gnubash&logoColor=white)
@@ -97,7 +97,7 @@ This script walks you through the whole setup with questions first and changes s
    ██████╔╝██████╔╝███████╗   Proxmox Backup Server  4.2.8
    ██╔═══╝ ██╔══██╗╚════██║   iSCSI storage on Synology
    ██║     ██████╔╝███████║   ● ALL SYSTEMS HEALTHY
-   ╚═╝     ╚═════╝ ╚══════╝   pbs-motd v1.12.1 · by MorphyDK
+   ╚═╝     ╚═════╝ ╚══════╝   pbs-motd v1.12.2 · by MorphyDK
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   ╭─ Server
@@ -107,7 +107,7 @@ This script walks you through the whole setup with questions first and changes s
   │ System disk    ████░░░░░░░░░░░░░░░░░░░░  17%  4.8GB of 28GB
   │ Updates        ✔ up to date (checked 5h ago)
   │ Reboot         (shown in red when a newer kernel is installed than the one running)
-  │ Installer      ✔ v1.12.1 · newest version (checked 3h ago)
+  │ Installer      ✔ v1.12.2 · newest version (checked 3h ago)
   ╰─
 
   ╭─ iSCSI storage · /mnt/synology
@@ -299,7 +299,7 @@ In the **live dashboard** a key bar at the bottom shows what you can do: `m` men
    ██████╗ ██████╗ ███████╗   pbs  192.168.0.57
    ██╔══██╗██╔══██╗██╔════╝   Proxmox Backup Server  4.2.8
    ██████╔╝██████╔╝███████╗   ● ALL SYSTEMS HEALTHY
-   ╚═╝     ╚═════╝ ╚══════╝   pbs-motd v1.12.1 · by MorphyDK
+   ╚═╝     ╚═════╝ ╚══════╝   pbs-motd v1.12.2 · by MorphyDK
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   ▄▄▄  synology-Thick  thick · ext4 · 20GB   ● connected
   █●█  █░░░░░░░░░░░░░░░░░░░░░░░░░░░   1%  20GB free
@@ -455,7 +455,7 @@ Add `--dry-run` to the installer, `--add-drive`, `--remove-drive` or `--uninstal
 ./pbs-post-install.sh --uninstall --dry-run
 ```
 
-For the installer you answer the questions as usual. The connection test logs in to the Synology briefly and logs out again, and anything created for it is removed at the end. Then you get the plan as numbered steps built from your answers. The iSCSI tools must already be installed, because a dry run never installs anything. The plan follows your answers; the real run checks each step as it goes.
+For the installer you answer the questions as usual. The connection test logs in to the Synology briefly and logs out again, and anything created for it is removed at the end. Then you get the plan as numbered steps built from your answers. A dry run never installs anything. On a fresh server without the iSCSI tools it still works: it skips the connection test, you type the Synology details and say what the LUN is like (new, holds existing backups, or erase), and the plan starts with installing the tools. The plan follows your answers; the real run checks each step as it goes.
 
 ---
 

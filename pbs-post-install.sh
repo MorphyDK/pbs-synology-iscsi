@@ -7,7 +7,7 @@
 # 
 # Thanks to Derek Seaman's Tech Blog who inspired me to make this.
 #
-# Version 1.12.1  27/10-2026
+# Version 1.12.2  27/10-2026
 # Author MorphyDK
 #
 # Usage:  ./pbs-post-install.sh              interactive installer
@@ -21,6 +21,14 @@
 #         ./pbs-post-install.sh --motd-remove  remove the login screen again
 #         ./pbs-post-install.sh --motd-update  silent update of the login screen, keeps settings
 #         ./pbs-post-install.sh --help
+#
+# Changes in 1.12.2:
+#  - --dry-run now also works on a fresh server without open-iscsi / parted / xfsprogs: it skips the
+#    connection test, you type the Synology details and say what the LUN is like (new, existing
+#    backups, or erase), and you get the full plan - which starts with installing the tools
+#  - Fix: the dry run wrongly said the iSCSI tools were missing when they were installed but the
+#    iscsid service was idle (it starts on demand). It now asks iscsiadm instead
+#  - A rejected target IQN is no longer pre-filled in the next try
 #
 # Changes in 1.12.1:
 #  - The installer now refuses a mount path that already belongs to another drive (another target
@@ -197,7 +205,7 @@
 set -eE
 export LC_ALL=C.UTF-8
 
-VERSION="1.12.1"
+VERSION="1.12.2"
 LOG_FILE="/var/log/pbs-post-install.log"
 FS_LABEL="pbs-data"
 FOUR_TIB=4398046511104
@@ -250,6 +258,7 @@ DO_DS=1
 DO_NAG=0              # off by default: hiding the subscription popup is opt-in
 DO_MOTD=1
 DRY_RUN=0            # 1 = --dry-run: show what would happen, change nothing
+DRY_OFFLINE=0        # 1 = dry run on a server without the iSCSI tools: no Synology test, you describe the LUN
 ADD_DRIVE=0          # 1 = --add-drive: only connect another drive (no repo/upgrade/popup/login-screen steps)
 MOTD_MODE="prompt"   # prompt | dashboard | live
 GUIDE_DONE=0
@@ -1607,23 +1616,34 @@ setup_options() {
 }
 
 setup_tools() {
+    local rc
     render_setup 2
     if [[ $DRY_RUN -eq 1 ]]; then
-        if command -v iscsiadm >/dev/null 2>&1 && command -v parted >/dev/null 2>&1 \
-            && command -v mkfs.xfs >/dev/null 2>&1 && systemctl is-active --quiet iscsid; then
-            ok "iSCSI tools are installed and running - nothing is changed here in a dry run"
+        rc=0
+        if command -v iscsiadm >/dev/null 2>&1; then
+            iscsiadm -m node >/dev/null 2>&1 || rc=$?   # 0 or 21 (no records yet) = iscsid answers
+        else
+            rc=127
+        fi
+        if [[ $rc -eq 0 || $rc -eq 21 ]] && command -v parted >/dev/null 2>&1 && command -v mkfs.xfs >/dev/null 2>&1; then
+            ok "iSCSI tools are installed - nothing is changed here in a dry run"
             INITIATOR_IQN=$(awk -F= '/^InitiatorName=/ {print $2}' /etc/iscsi/initiatorname.iscsi 2>/dev/null || true)
             ok "This server's initiator name: ${WHITE}${INITIATOR_IQN:-unknown}${NC}"
             echo
             press_enter
             return 0
         fi
-        echo "  ${YELLOW}The iSCSI tools (open-iscsi, parted, xfsprogs) are not installed or not running here.${NC}"
-        echo "  A dry run does not install anything, so it cannot test the connection to the Synology."
-        echo "  The real installer would install them first. To preview the rest, install them yourself:"
-        echo "      ${WHITE}apt install open-iscsi parted xfsprogs${NC}   and run  ${WHITE}$0 --dry-run${NC}  again."
+        DRY_OFFLINE=1
+        INITIATOR_IQN="${INITIATOR_IQN:-(created when open-iscsi is installed)}"
+        panel_top "Dry run without the iSCSI tools" "$CYAN"
+        panel_line "open-iscsi, parted or xfsprogs is missing, or the iSCSI service does not answer (iscsiadm exit ${rc})."
+        panel_line "A dry run never installs anything, so it cannot talk to the Synology."
+        panel_line "${WHITE}It will skip the connection test and ask you what the LUN looks like instead.${NC}"
+        panel_line "The plan at the end is what the real installer would do - it installs the tools first."
+        panel_bottom
         echo
-        exit 0
+        press_enter
+        return 0
     fi
     if command -v iscsiadm >/dev/null 2>&1 && command -v parted >/dev/null 2>&1 \
         && command -v mkfs.xfs >/dev/null 2>&1; then
@@ -1790,6 +1810,7 @@ choose_target() {
                 break
             fi
             err "That is not an iSCSI name. It starts with iqn. followed by a year and month, like iqn.2000-01.com.synology:..."
+            TARGET_IQN=""
         done
     else
         TARGET_IQN="${DISCOVERED_TARGETS[choice]}"
@@ -1890,8 +1911,54 @@ show_login_error() {
     panel_bottom
 }
 
+dry_offline_connection() {   # dry run without iSCSI tools: type the details, nothing is tested
+    render_setup 4
+    echo "  ${DIM}Offline dry run: nothing is tested against the Synology.${NC}"
+    echo
+    ask_required PORTAL_IP "Synology IP address" "the NAS address on your iSCSI network, e.g. 192.168.2.100" "$PORTAL_IP"
+    PORTAL_IP="${PORTAL_IP// /}"
+    while true; do
+        ask_required TARGET_IQN "Target IQN" "DSM › SAN Manager › iSCSI › Target, e.g. iqn.2000-01.com.synology:DS923.Target-1.2c0d1f17e14" "$TARGET_IQN"
+        if [[ "$TARGET_IQN" =~ ^(iqn\.[0-9]{4}-[0-9]{2}\.[^[:space:]]+|eui\.[0-9A-Fa-f]+|naa\.[0-9A-Fa-f]+)$ ]]; then
+            break
+        fi
+        err "That is not an iSCSI name. It starts with iqn. followed by a year and month, like iqn.2000-01.com.synology:..."
+        TARGET_IQN=""
+    done
+    ok "Target: ${TARGET_IQN}"
+    ask_chap fresh
+}
+
+dry_offline_lun() {   # dry run without iSCSI tools: say what the LUN is like
+    local choice
+    render_setup 5
+    panel_top "Describe the LUN" "$CYAN"
+    panel_line "The real installer would look at the LUN and decide. Here you say what it is like,"
+    panel_line "so the plan shows the right steps."
+    panel_bottom
+    LUN_SIZE=""; LUN_SIZE_H="(size unknown)"; LUN_EMPTY=0; PROBE_PBS=0; PROBE_PBS_SUB=""
+    menu_select choice 0 \
+        "A new, empty LUN|The installer creates a partition and a filesystem" \
+        "A LUN that already holds my PBS backups|Keep everything and re-attach the datastore" \
+        "A LUN I want erased and formatted|Everything on it is lost"
+    case "$choice" in
+        0) DISK_ACTION="new"; choose_filesystem ;;
+        1)
+            DISK_ACTION="keep"; PROBE_PBS=1
+            menu_select choice 0 "ext4|The existing filesystem is ext4" "XFS|The existing filesystem is XFS"
+            if [[ $choice -eq 0 ]]; then FS_TYPE="ext4"; else FS_TYPE="xfs"; fi
+            ;;
+        *) DISK_ACTION="format"; choose_filesystem ;;
+    esac
+    menu_select choice 0 \
+        "Thin|Allocation on the Synology, with space reclamation (weekly TRIM)" \
+        "Thick|Space reserved on the Synology, no TRIM needed"
+    if [[ $choice -eq 0 ]]; then LUN_PROV="thin"; LUN_DISCARD=1; else LUN_PROV="thick"; LUN_DISCARD=0; fi
+}
+
 setup_connection() {
     local choice
+    if [[ $DRY_OFFLINE -eq 1 ]]; then dry_offline_connection; return 0; fi
     render_setup 4
     echo "  ${DIM}Everything is tested right away - before anything on this server is changed.${NC}"
     choose_portal
@@ -1968,6 +2035,7 @@ choose_filesystem() {
 
 setup_lun() {
     local choice keep_label devs
+    if [[ $DRY_OFFLINE -eq 1 ]]; then dry_offline_lun; return 0; fi
     while true; do
         render_setup 5
         info "Waiting for the LUN to appear..."
@@ -2220,7 +2288,9 @@ setup_alerts() {
                     fi
                     err "The URL must start with http:// or https:// and contain no spaces."
                 done
-                if ! command -v curl >/dev/null 2>&1; then
+                if ! command -v curl >/dev/null 2>&1 && [[ $DRY_RUN -eq 1 ]]; then
+                    info "curl is not installed - the real installer would install it."
+                elif ! command -v curl >/dev/null 2>&1; then
                     run_quiet "Installing curl" "${APT_ENV[@]}" apt-get "${APT_OPTS[@]}" install curl
                 fi
                 NOTIFY_MODE="url"
@@ -5866,6 +5936,9 @@ dry_run_plan() {
     render_setup 7
     echo "  ${CYAN}━━━ DRY RUN: what the installer would do, in this order. Nothing is changed. ━━━${NC}"
     echo
+    if [[ $DRY_OFFLINE -eq 1 ]]; then
+        P "install open-iscsi, parted and xfsprogs, load the iSCSI kernel modules and start the iSCSI service (this happens first, before the questions of the real run)"
+    fi
     if [[ $DO_REPO -eq 1 ]]; then
         P "switch to the no-subscription repository (enterprise repository off, writes /etc/apt/sources.list.d/pbs-no-subscription.sources)"
     fi
@@ -5919,7 +5992,11 @@ dry_run_plan() {
     fi
     echo
     echo "  ${DIM}This plan follows your answers. The real run checks every step as it goes and stops if something is wrong.${NC}"
-    echo "  ${DIM}The connection test above logged in to the Synology briefly and logged out again; anything created for it is removed when this ends.${NC}"
+    if [[ $DRY_OFFLINE -eq 1 ]]; then
+        echo "  ${DIM}Offline dry run: the Synology was not contacted and the LUN is what you described. The real run tests the connection and looks at the LUN first.${NC}"
+    else
+        echo "  ${DIM}The connection test above logged in to the Synology briefly and logged out again; anything created for it is removed when this ends.${NC}"
+    fi
     echo "  ${CYAN}Dry run finished. Nothing was changed.${NC}  Run  ${WHITE}$0${NC}  to do it for real."
     echo
 }
