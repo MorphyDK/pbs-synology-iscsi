@@ -7,7 +7,7 @@
 # 
 # Thanks to Derek Seaman's Tech Blog who inspired me to make this.
 #
-# Version 1.12.3  27/10-2026
+# Version 1.12.5  27/10-2026
 # Author MorphyDK
 #
 # Usage:  ./pbs-post-install.sh              interactive installer
@@ -21,6 +21,16 @@
 #         ./pbs-post-install.sh --motd-remove  remove the login screen again
 #         ./pbs-post-install.sh --motd-update  silent update of the login screen, keeps settings
 #         ./pbs-post-install.sh --help
+#
+# Changes in 1.12.5:
+#  - The LUN list (when a target holds several LUNs) is clearer: free LUNs first, LUNs that are
+#    already a drive here marked "in use" with their datastore and mount path, what is on the
+#    others (empty / filesystem), and the last digits of the ID. --add-drive no longer exits when
+#    you pick a LUN that is already a drive: it asks you to choose again
+#
+# Changes in 1.12.4:
+#  - Remove a drive: the list now shows target, datastore and mount path, and says that only this
+#    server's side is removed (the LUN and its data on the Synology stay)
 #
 # Changes in 1.12.3:
 #  - The installer now rescans the target's session before it lists the LUNs, so a LUN you mapped
@@ -210,7 +220,7 @@
 set -eE
 export LC_ALL=C.UTF-8
 
-VERSION="1.12.3"
+VERSION="1.12.5"
 LOG_FILE="/var/log/pbs-post-install.log"
 FS_LABEL="pbs-data"
 FOUR_TIB=4398046511104
@@ -1250,25 +1260,67 @@ pick_chosen_lun() {
 }
 
 # Lets the user choose between several LUNs on the target -> sets DEVICE_PATH
+# lun_drive_info /dev/sdX -> sets LD_MNT (mount point or ""), LD_NAME (drive set up here or "") and LD_DS (its datastores)
+lun_drive_info() {
+    local s mp
+    LD_MNT=$(lsblk -nro MOUNTPOINT "$1" 2>/dev/null | grep -m1 '[^[:space:]]' || true)
+    LD_NAME=""; LD_DS=""
+    if [[ -z "$LD_MNT" ]]; then return 0; fi
+    for s in /usr/local/bin/check-iscsi-session-*.sh; do
+        [[ -f "$s" ]] || continue
+        mp=$(awk -F= '/^MOUNT_PATH=/ { print $2; exit }' "$s" | tr -d "\"'")
+        if [[ "$mp" == "$LD_MNT" ]]; then
+            LD_NAME=$(basename "$mp")
+            LD_DS=$(datastores_on "$mp" | paste -sd, - || true)
+            break
+        fi
+    done
+}
+
 choose_lun() {
-    local -a items=()
-    local d sz model num choice
+    local -a items=() free=() used=() ord=()
+    local d sz model num choice wwn state hint i
+    local -A STATE=() HINT=()
     for d in "${LUN_DEVS[@]}"; do
         sz=$(lun_attr "$d" SIZE)
         model=$(lsblk -dno VENDOR,MODEL "$d" 2>/dev/null | head -n 1 | xargs || true)
         num=$(lun_number "$d")
-        items+=("${d}  ${sz}  ${model}  (LUN ${num:-?})|WWN $(lun_attr "$d" WWN)  ·  $(lun_summary "$d")")
+        wwn=$(lun_attr "$d" WWN)
+        lun_drive_info "$d"
+        if [[ -n "$LD_NAME" ]]; then
+            state="in use · ${LD_DS:-no datastore}"
+            hint="Already a drive here: ${LD_NAME} · ${LD_MNT}"
+            used+=("$d")
+        else
+            state="$(lun_summary "$d")"
+            hint="Free to use"
+            free+=("$d")
+        fi
+        STATE[$d]="${d}  ${sz}  (LUN ${num:-?})  ·  ${state}"
+        HINT[$d]="${hint}  ·  ${model:-?}  ·  ID …${wwn: -8}"
     done
-    echo
-    panel_top "This target holds ${#LUN_DEVS[@]} LUNs" "$YELLOW"
-    panel_line "Pick the one that should store the backups."
-    panel_line "${DIM}The other LUNs are not touched.${NC}"
-    panel_bottom
-    menu_select choice 0 "${items[@]}" "Quit|Nothing has been changed"
-    if [[ $choice -ge ${#LUN_DEVS[@]} ]]; then
-        quit_clean
-    fi
-    DEVICE_PATH="${LUN_DEVS[choice]}"
+    ord=("${free[@]}" "${used[@]}")
+    while true; do
+        items=()
+        for d in "${ord[@]}"; do items+=("${STATE[$d]}|${HINT[$d]}"); done
+        echo
+        panel_top "This target holds ${#LUN_DEVS[@]} LUNs" "$YELLOW"
+        panel_line "Pick the one that should store the backups. LUNs that are free come first."
+        panel_line "${DIM}The Synology does not send the LUN name to this server, so size and LUN number identify it.${NC}"
+        panel_line "${DIM}The other LUNs are not touched.${NC}"
+        panel_bottom
+        menu_select choice 0 "${items[@]}" "Quit|Nothing has been changed"
+        if [[ $choice -ge ${#ord[@]} ]]; then
+            quit_clean
+        fi
+        DEVICE_PATH="${ord[choice]}"
+        lun_drive_info "$DEVICE_PATH"
+        if [[ $ADD_DRIVE -eq 1 && -n "$LD_NAME" ]]; then
+            err "That LUN is already a drive here (${LD_NAME}). Choose one that is free."
+            continue
+        fi
+        break
+    done
     ok "LUN: ${DEVICE_PATH}"
 }
 
@@ -5735,10 +5787,10 @@ run_remove_drive() {
         # shellcheck disable=SC1090
         source <(grep -E '^(TARGET|PORTAL|MOUNT_PATH)=' "$s")
         ds_list=$(datastores_on "$MOUNT_PATH" | paste -sd, - || true)
-        items+=("$(basename "$MOUNT_PATH")|${MOUNT_PATH} · ${TARGET##*:} · datastore: ${ds_list:-none}")
+        items+=("${TARGET##*:} · ${ds_list:-no datastore} · ${MOUNT_PATH}|Removed from this server only - the LUN and its data on the Synology stay")
     done
     items+=("Cancel|Nothing is changed")
-    echo "  ${WHITE}Which drive do you want to remove?${NC}"
+    echo "  ${WHITE}Which drive do you want to remove?${NC}  ${DIM}(target · datastore · mount path)${NC}"
     menu_select choice 0 "${items[@]}"
     if [[ $choice -ge ${#scripts[@]} ]]; then
         echo "  ${YELLOW}Cancelled - nothing was changed.${NC}"
