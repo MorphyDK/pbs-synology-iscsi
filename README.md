@@ -8,7 +8,7 @@
 
 *Plain shell menus · CHAP · ext4 or XFS · keeps your data · repairs itself · live login dashboard · one-key self-update*
 
-![version](https://img.shields.io/badge/version-1.10.4-2f81f7?style=for-the-badge)
+![version](https://img.shields.io/badge/version-1.12.0-2f81f7?style=for-the-badge)
 ![debian](https://img.shields.io/badge/Debian-13%20trixie-d70a53?style=for-the-badge&logo=debian&logoColor=white)
 ![pbs](https://img.shields.io/badge/Proxmox%20Backup%20Server-4.x-e57000?style=for-the-badge)
 ![bash](https://img.shields.io/badge/Bash-5.x-4eaa25?style=for-the-badge&logo=gnubash&logoColor=white)
@@ -97,7 +97,7 @@ This script walks you through the whole setup with questions first and changes s
    ██████╔╝██████╔╝███████╗   Proxmox Backup Server  4.2.8
    ██╔═══╝ ██╔══██╗╚════██║   iSCSI storage on Synology
    ██║     ██████╔╝███████║   ● ALL SYSTEMS HEALTHY
-   ╚═╝     ╚═════╝ ╚══════╝   pbs-motd v1.10.4 · by MorphyDK
+   ╚═╝     ╚═════╝ ╚══════╝   pbs-motd v1.12.0 · by MorphyDK
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   ╭─ Server
@@ -107,7 +107,7 @@ This script walks you through the whole setup with questions first and changes s
   │ System disk    ████░░░░░░░░░░░░░░░░░░░░  17%  4.8GB of 28GB
   │ Updates        ✔ up to date (checked 5h ago)
   │ Reboot         (shown in red when a newer kernel is installed than the one running)
-  │ Installer      ✔ v1.10.4 · newest version (checked 3h ago)
+  │ Installer      ✔ v1.12.0 · newest version (checked 3h ago)
   ╰─
 
   ╭─ iSCSI storage · /mnt/synology
@@ -299,7 +299,7 @@ In the **live dashboard** a key bar at the bottom shows what you can do: `m` men
    ██████╗ ██████╗ ███████╗   pbs  192.168.0.57
    ██╔══██╗██╔══██╗██╔════╝   Proxmox Backup Server  4.2.8
    ██████╔╝██████╔╝███████╗   ● ALL SYSTEMS HEALTHY
-   ╚═╝     ╚═════╝ ╚══════╝   pbs-motd v1.10.4 · by MorphyDK
+   ╚═╝     ╚═════╝ ╚══════╝   pbs-motd v1.12.0 · by MorphyDK
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   ▄▄▄  synology-Thick  thick · ext4 · 20GB   ● connected
   █●█  █░░░░░░░░░░░░░░░░░░░░░░░░░░░   1%  20GB free
@@ -383,6 +383,9 @@ The file is downloaded over HTTPS from this repository's release tag. You trust 
 ./pbs-post-install.sh --fix-login     type the CHAP username/password again
 ./pbs-post-install.sh --add-drive     connect one more Synology LUN
 ./pbs-post-install.sh --remove-drive  remove a drive (datastore, monitor, mount, iSCSI login)
+./pbs-post-install.sh --uninstall     remove everything this script added (backups on the Synology stay)
+./pbs-post-install.sh --dry-run       add to the installer, --add-drive, --remove-drive or --uninstall:
+                                      show every step first, change nothing
 ./pbs-post-install.sh --motd          install or update only the login screen
 ./pbs-post-install.sh --motd-remove   remove the login screen
 ./pbs-post-install.sh --motd-update   update login screen + script, keep all settings
@@ -439,6 +442,20 @@ It prints plain text when piped, so it works in cron:
 - Use a **dedicated CHAP login** for this target, not one you use anywhere else.
 - Allow only this server's initiator IQN on the Synology.
 - Read the script before running it. It is plain bash, and it runs as root. Do not pipe it into a shell. See [Review it before you run it](#review-it-before-you-run-it).
+
+---
+
+## Preview with `--dry-run`
+
+Add `--dry-run` to the installer, `--add-drive`, `--remove-drive` or `--uninstall` and it shows what it would do, then stops. Nothing on the server is changed.
+
+```bash
+./pbs-post-install.sh --dry-run
+./pbs-post-install.sh --remove-drive --dry-run
+./pbs-post-install.sh --uninstall --dry-run
+```
+
+For the installer you answer the questions as usual. The connection test logs in to the Synology briefly and logs out again, and anything created for it is removed at the end. Then you get the plan as numbered steps built from your answers. The iSCSI tools must already be installed, because a dry run never installs anything. The plan follows your answers; the real run checks each step as it goes.
 
 ---
 
@@ -576,6 +593,8 @@ iscsiadm -m node -T <target-iqn> -p <portal> -o delete
 
 The easy way for one drive: `pbs-menu` › **2 Drives** › **Remove a drive** (or `pbs-post-install.sh --remove-drive`), see [Drives: add and remove](#drives-add-and-remove). The manual steps above are what it does for you.
 
+**Remove everything:** `pbs-menu` › **2 Drives** › **Uninstall everything**, or `pbs-post-install.sh --uninstall`. It is all or nothing. It clears the screen, shows a red warning and every step it will take, and only starts when you type `UNINSTALL`. It removes the datastores from PBS (never the backup files), the monitors, mounts and fstab lines, the iSCSI logins, the login screen, the popup patch (if you used it) and the installer copy. **Nothing on the Synology is touched**, so your backups stay on the LUN. It does not remove the `open-iscsi` package or your PBS repository setting. Want to see it first? `pbs-post-install.sh --uninstall --dry-run` lists each step and changes nothing. Afterwards, remove the storage entry in Proxmox VE by hand.
+
 The datastore itself is removed in the PBS web UI (Datastore › Remove). That does not delete the backups on the LUN.
 
 ---
@@ -584,7 +603,7 @@ The datastore itself is removed in the PBS web UI (Datastore › Remove). That d
 
 **Developed and run against:** Proxmox Backup Server 4.2.x on Debian 13 (trixie), a Synology NAS over iSCSI with CHAP, one thin and one thick LUN (ext4), with TRIM and the login dashboard on two drives.
 
-**Run by the author on a real setup:** the full installation on Proxmox Backup Server 4.2 with a Synology NAS, tested and in use. **Run on real hardware (v1.10.x):** the self-update from GitHub (v1.9.1 → v1.9.2 → v1.9.3 → v1.10.0, press `i`), *Remove a drive* and *Add a drive* on a Synology. The rollback after a failed update, a file with the wrong version or a syntax error (refused), no network, auto-install and `--rollback` were tested against a simulated GitHub only. *Remove a drive* was also run against simulated tools for the edge cases: a running task (refused), PBS refusing the datastore removal, a busy drive, and two drives on one target.
+**Run by the author on a real setup:** the full installation on Proxmox Backup Server 4.2 with a Synology NAS, tested and in use. **Run on real hardware (v1.10.x):** the self-update from GitHub (v1.9.1 → v1.9.2 → v1.9.3 → v1.10.0, press `i`), *Remove a drive* and *Add a drive* on a Synology. **`--uninstall` and `--dry-run` (v1.11.0 and later) were tested against simulated tools only** (dry-run, cancel, a full run); please try `--uninstall --dry-run` first on your own server. The rollback after a failed update, a file with the wrong version or a syntax error (refused), no network, auto-install and `--rollback` were tested against a simulated GitHub only. *Remove a drive* was also run against simulated tools for the edge cases: a running task (refused), PBS refusing the datastore removal, a busy drive, and two drives on one target.
 
 **Not yet verified on real hardware:** what happens through a full DSM update/reboot with a backup running, the automatic repair after a long outage, and XFS on very large LUNs. **Please test restores before you rely on any backup setup**, and open an issue if something behaves differently on your system.
 
@@ -596,7 +615,6 @@ The datastore itself is removed in the PBS web UI (Datastore › Remove). That d
 
 - Backblaze B2 as a remote datastore (PBS S3 datastores, tech preview)
 - Datastore prune and garbage-collection presets
-- `--uninstall` (remove everything this script added) and `--dry-run`
 
 ---
 

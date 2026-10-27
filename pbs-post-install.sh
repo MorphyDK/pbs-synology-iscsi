@@ -7,7 +7,7 @@
 # 
 # Thanks to Derek Seaman's Tech Blog who inspired me to make this.
 #
-# Version 1.10.4  27/10-2026
+# Version 1.12.0  27/10-2026
 # Author MorphyDK
 #
 # Usage:  ./pbs-post-install.sh              interactive installer
@@ -15,10 +15,25 @@
 #         ./pbs-post-install.sh --fix-login  re-enter the CHAP login of an installed target
 #         ./pbs-post-install.sh --add-drive  connect one more Synology LUN
 #         ./pbs-post-install.sh --remove-drive  take a drive away again
+#         ./pbs-post-install.sh --uninstall  remove everything this installer set up (backups on the Synology stay)
+#         ./pbs-post-install.sh --dry-run    with the installer, --add-drive, --remove-drive or --uninstall: change nothing
 #         ./pbs-post-install.sh --motd       install / update only the login screen
 #         ./pbs-post-install.sh --motd-remove  remove the login screen again
 #         ./pbs-post-install.sh --motd-update  silent update of the login screen, keeps settings
 #         ./pbs-post-install.sh --help
+#
+# Changes in 1.12.0:
+#  - --dry-run now works with the installer, --add-drive and --remove-drive too (and --uninstall).
+#    The questions and the short connection test run as usual (the test logs in and out of the
+#    Synology and is cleaned up); then you get the plan, step by step, and nothing is changed.
+#    The iSCSI tools must already be installed; a dry run never installs anything
+#
+# Changes in 1.11.0:
+#  - New: --uninstall (also in pbs-menu > Drives > Uninstall everything). All or nothing: shows a
+#    red warning and every step first, asks you to type UNINSTALL, then removes the datastores from
+#    PBS (never the backup files), monitors, mounts, fstab lines, iSCSI logins, login screen,
+#    popup patch and the installer copy. Nothing on the Synology is touched
+#  - New: --uninstall --dry-run shows each step and changes nothing
 #
 # Changes in 1.10.4:
 #  - Removing the "No valid subscription" popup is now opt-in: the option is OFF until you tick it
@@ -174,7 +189,7 @@
 set -eE
 export LC_ALL=C.UTF-8
 
-VERSION="1.10.4"
+VERSION="1.12.0"
 LOG_FILE="/var/log/pbs-post-install.log"
 FS_LABEL="pbs-data"
 FOUR_TIB=4398046511104
@@ -226,6 +241,7 @@ DO_ISCSI=1
 DO_DS=1
 DO_NAG=0              # off by default: hiding the subscription popup is opt-in
 DO_MOTD=1
+DRY_RUN=0            # 1 = --dry-run: show what would happen, change nothing
 ADD_DRIVE=0          # 1 = --add-drive: only connect another drive (no repo/upgrade/popup/login-screen steps)
 MOTD_MODE="prompt"   # prompt | dashboard | live
 GUIDE_DONE=0
@@ -1026,6 +1042,7 @@ find_stale_records() {
 # versions) and offers to remove them. They log in at boot and fill the
 # Synology's log with failed logins when they have no valid CHAP login.
 offer_stale_cleanup() {
+    if [[ $DRY_RUN -eq 1 ]]; then return 0; fi   # a dry run never deletes anything
     local -a stale=()
     local rec portal iqn startup auth broken=0 choice def=1 line
     KNOWN_NODES=("${TARGET_IQN}|$(norm_portal "$PORTAL_IP")")
@@ -1577,6 +1594,23 @@ setup_options() {
 
 setup_tools() {
     render_setup 2
+    if [[ $DRY_RUN -eq 1 ]]; then
+        if command -v iscsiadm >/dev/null 2>&1 && command -v parted >/dev/null 2>&1 \
+            && command -v mkfs.xfs >/dev/null 2>&1 && systemctl is-active --quiet iscsid; then
+            ok "iSCSI tools are installed and running - nothing is changed here in a dry run"
+            INITIATOR_IQN=$(awk -F= '/^InitiatorName=/ {print $2}' /etc/iscsi/initiatorname.iscsi 2>/dev/null || true)
+            ok "This server's initiator name: ${WHITE}${INITIATOR_IQN:-unknown}${NC}"
+            echo
+            press_enter
+            return 0
+        fi
+        echo "  ${YELLOW}The iSCSI tools (open-iscsi, parted, xfsprogs) are not installed or not running here.${NC}"
+        echo "  A dry run does not install anything, so it cannot test the connection to the Synology."
+        echo "  The real installer would install them first. To preview the rest, install them yourself:"
+        echo "      ${WHITE}apt install open-iscsi parted xfsprogs${NC}   and run  ${WHITE}$0 --dry-run${NC}  again."
+        echo
+        exit 0
+    fi
     if command -v iscsiadm >/dev/null 2>&1 && command -v parted >/dev/null 2>&1 \
         && command -v mkfs.xfs >/dev/null 2>&1; then
         ok "iSCSI tools are already installed"
@@ -2273,8 +2307,10 @@ setup_review() {
     kv "Popup" "$( [[ $DO_NAG -eq 1 ]] && echo 'remove the subscription popup (you chose this)' || echo 'unchanged' )"
     kv "Login screen" "$( [[ $DO_MOTD -eq 1 ]] && case "$MOTD_MODE" in prompt) echo 'dashboard + menu prompt' ;; dashboard) echo 'dashboard only' ;; live) echo 'live dashboard (stays open until q)' ;; esac || echo 'unchanged' )"
     panel_bottom
+    local start_item="Start the installation|Runs on its own from here - grab a coffee"
+    if [[ $DRY_RUN -eq 1 ]]; then start_item="Show the dry-run plan|Nothing is changed"; fi
     menu_select choice 0 \
-        "Start the installation|Runs on its own from here - grab a coffee" \
+        "$start_item" \
         "Go back and change something|Your answers are kept as defaults" \
         "Quit|Nothing on any disk has been changed"
     case "$choice" in
@@ -3891,19 +3927,21 @@ screen_drives() {   # the Drives submenu: details, add, CHAP login, remove
         n=$(mon_scripts | wc -l)
         echo
         panel_top "Drives"
-        panel_line "${n} drive(s) set up on this server. ${DIM}Remove never erases data on the Synology.${NC}"
+        panel_line "${n} drive(s) set up on this server. ${DIM}Remove and Uninstall never erase data on the Synology.${NC}"
         panel_bottom
         menu_select c 0 \
             "Drive details|Target, login, session details and disks of every drive (read-only)" \
             "Add a drive|Connect another Synology LUN and create or re-attach its datastore" \
             "Change the CHAP login|Type the username/password again (Synology log: CHAP required but absent)" \
             "Remove a drive|Disconnect a LUN from this server and remove its datastore from PBS" \
+            "Uninstall everything|Remove all drives, the login screen and the installer (backups on the Synology stay)" \
             "Back"
         case "$c" in
             0) page_run screen_lun; press_key ;;
             1) drive_tool --add-drive; return 0 ;;
             2) drive_tool --fix-login; return 0 ;;
             3) drive_tool --remove-drive; return 0 ;;
+            4) drive_tool --uninstall; return 0 ;;
             *) return 0 ;;
         esac
     done
@@ -3918,6 +3956,8 @@ drive_tool() {   # runs the installer full-screen (it draws its own screens), th
         echo "  ${YELLOW}The installer copy (${INSTALLER}) was not found - run: pbs-motd --update-installer${NC}"
     fi
     press_key
+    # an uninstall removes this menu too - leave instead of coming back to a menu that is gone
+    if [ "$1" = "--uninstall" ] && [ ! -e /usr/local/sbin/pbs-motd ]; then exit 0; fi
 }
 
 screen_storage() {
@@ -5005,6 +5045,10 @@ step_finish() {
 }
 
 run_install() {
+    if [[ $DRY_RUN -eq 1 ]]; then
+        dry_run_plan
+        return 0
+    fi
     PHASE="install"
     INSTALL_STARTED=1
     mono
@@ -5630,6 +5674,11 @@ run_remove_drive() {
     panel_line "${DIM}space back, the LUN on the Synology. You get a reminder at the end.${NC}"
     panel_bottom
     echo
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "  ${CYAN}Dry run finished. Nothing was changed.${NC}  Run  ${WHITE}$0 --remove-drive${NC}  to do it for real."
+        echo
+        return 0
+    fi
     echo "  ${RED}⚠  Backups on this datastore will no longer be reachable from PBS.${NC}"
     ask_input confirm "Type the drive name (${name}) to continue, or press Enter to cancel"
     if [[ "$confirm" != "$name" ]]; then
@@ -5763,6 +5812,397 @@ run_remove_drive() {
     echo
 }
 
+# ---- dry run of the installer: the plan, built from your answers --------------------------
+P() { DRY_N=$(( DRY_N + 1 )); printf '  %s[dry-run]%s %2d. would %s\n' "$CYAN" "$NC" "$DRY_N" "$*"; }
+
+dry_run_plan() {
+    local name trim_txt="" ds_txt
+    DRY_N=0
+    name=$(basename "${MOUNT_PATH:-drive}")
+    render_setup 7
+    echo "  ${CYAN}━━━ DRY RUN: what the installer would do, in this order. Nothing is changed. ━━━${NC}"
+    echo
+    if [[ $DO_REPO -eq 1 ]]; then
+        P "switch to the no-subscription repository (enterprise repository off, writes /etc/apt/sources.list.d/pbs-no-subscription.sources)"
+    fi
+    if [[ $DO_UPGRADE -eq 1 ]]; then
+        P "run apt full-upgrade (can take a few minutes; a reboot may be advised afterwards)"
+    fi
+    if [[ $DO_ISCSI -eq 1 ]]; then
+        P "set only this target to log in automatically at boot and wait up to $(( REPLACEMENT_TIMEOUT / 60 )) min for the NAS to come back"
+        if [[ $CHAP_MODE -eq 1 ]]; then
+            P "keep the CHAP login for ${TARGET_IQN##*:} (user ${CHAP_USER}) in the root-only iSCSI node record; the password is never logged"
+        fi
+        P "log in to ${TARGET_IQN##*:} at ${PORTAL_IP}"
+        case "$DISK_ACTION" in
+            new)     P "create a GPT partition table and one partition on the new LUN, then format it as ${FS_TYPE}" ;;
+            format)  P "${RED}ERASE the LUN${NC}: remove old signatures, create a new GPT partition, format it as ${FS_TYPE}" ;;
+            keep)    P "keep the existing ${FS_TYPE:-filesystem} on the LUN - ${GREEN}no data is touched${NC}" ;;
+            mounted) P "leave the disk alone (it is already mounted)" ;;
+        esac
+        P "save a copy of /etc/fstab and add one line for ${MOUNT_PATH} (by UUID, _netdev,nofail)"
+        P "lock the empty folder ${MOUNT_PATH} (chattr +i) so nothing can write to the local disk if the mount is missing, then mount it"
+        if [[ $LUN_DISCARD -eq 1 ]]; then trim_txt=" and a weekly TRIM"; fi
+        P "install the monitor /usr/local/bin/check-iscsi-session-${name}.sh with a cron job every minute (health check, test write, auto-repair${trim_txt})"
+        P "make PBS start after the mount (systemd drop-ins 10-iscsi-${name}.conf) and add a logrotate rule for the monitor log"
+        case "$NOTIFY_MODE" in
+            url)  P "send a test alert to your push/webhook address" ;;
+            mail) P "send a test alert to ${NOTIFY_MAIL}" ;;
+        esac
+    fi
+    if [[ $DO_DS -eq 1 ]]; then
+        if [[ $DS_SKIP -eq 1 ]]; then
+            ds_txt="leave datastore '${DS_NAME}' as it is (it already exists)"
+        elif [[ $DS_REUSE -eq 1 ]]; then
+            ds_txt="re-attach datastore '${DS_NAME}' at ${DS_PATH} (your existing backups are kept)"
+        else
+            ds_txt="create datastore '${DS_NAME}' at ${DS_PATH}"
+        fi
+        P "$ds_txt"
+    fi
+    if [[ $DO_NAG -eq 1 ]]; then
+        P "remove the subscription popup (apt hook /etc/apt/apt.conf.d/no-nag-script, patches the web interface file, restarts the web interface)"
+    fi
+    if [[ $DO_MOTD -eq 1 ]]; then
+        P "install the login dashboard and menu (pbs-motd, pbs-menu, pbs-help, /etc/profile.d/pbs-motd.sh, mode: ${MOTD_MODE}) and a copy of this installer in /usr/local/sbin"
+    fi
+    if [[ $DRY_N -eq 0 ]]; then
+        echo "  Nothing would be done with these answers."
+    fi
+    echo
+    echo "  ${DIM}This plan follows your answers. The real run checks every step as it goes and stops if something is wrong.${NC}"
+    echo "  ${DIM}The connection test above logged in to the Synology briefly and logged out again; anything created for it is removed when this ends.${NC}"
+    echo "  ${CYAN}Dry run finished. Nothing was changed.${NC}  Run  ${WHITE}$0${NC}  to do it for real."
+    echo
+}
+
+# ===========================================================================
+# UNINSTALL  (--uninstall, optionally with --dry-run)
+# ===========================================================================
+# Takes everything this installer added off the server. All or nothing.
+# It NEVER erases backups: datastores are only removed from PBS's list (no --destroy-data)
+# and nothing is changed on the Synology. --dry-run prints each step and changes nothing.
+U_RC=0
+
+# U "what it does" command args...  - the one place where uninstall changes anything.
+# In dry-run it only says what it would do. Sets U_RC (never stops the script on failure).
+U() {
+    local desc="$1"
+    shift
+    U_RC=0
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "  ${CYAN}[dry-run]${NC} would: ${desc}"
+        return 0
+    fi
+    "$@" >> "$LOG_FILE" 2>&1 || U_RC=$?
+    if [[ $U_RC -eq 0 ]]; then
+        ok "$desc"
+    else
+        warn "${desc} - did not work (exit code ${U_RC}), see ${LOG_FILE}"
+    fi
+    return 0
+}
+
+u_cron_drop() {   # u_cron_drop NAME - remove the monitor's cron line
+    local tmp
+    tmp=$(mktemp)
+    cron_without_monitor "$1" > "$tmp"
+    crontab "$tmp"
+    rm -f "$tmp"
+}
+
+u_cron_back() {   # u_cron_back NAME SCRIPT - put the monitor's cron line back
+    local tmp
+    tmp=$(mktemp)
+    { cron_without_monitor "$1"; echo "*/1 * * * * ${2} # iSCSI monitor for ${1}"; } > "$tmp"
+    crontab "$tmp"
+    rm -f "$tmp"
+}
+
+u_fstab_drop() {  # u_fstab_drop MOUNT_PATH - remove its /etc/fstab line (a copy is kept)
+    local tmp
+    cp /etc/fstab "/etc/fstab.backup.$(date +%Y%m%d-%H%M%S)"
+    tmp=$(mktemp)
+    awk -v p="$1" '/^[[:space:]]*#/ || $2 != p' /etc/fstab > "$tmp"
+    cat "$tmp" > /etc/fstab
+    rm -f "$tmp"
+}
+
+u_mountdir_drop() {  # u_mountdir_drop MOUNT_PATH - the installer made it immutable; remove it when empty
+    chattr -i "$1" 2>/dev/null || true
+    if [[ -z "$(ls -A "$1" 2>/dev/null)" ]]; then
+        rmdir "$1"
+    else
+        echo "$1 is not empty (files on the local disk) - left in place"
+        return 1
+    fi
+}
+
+u_monitor_files_drop() {  # u_monitor_files_drop NAME SCRIPT
+    local f
+    for f in proxmox-backup proxmox-backup-proxy; do
+        rm -f "/etc/systemd/system/${f}.service.d/10-iscsi-${1}.conf"
+        rmdir "/etc/systemd/system/${f}.service.d" 2>/dev/null || true
+    done
+    rm -f "$2" "/etc/pbs-iscsi-monitor-${1}.conf" "/run/lock/iscsi-monitor-${1}.lock" \
+          "/run/iscsi-monitor-${1}.state" "/run/iscsi-monitor-${1}.state."*
+}
+
+u_iscsi_drop() {  # u_iscsi_drop TARGET PORTAL
+    local rc=0
+    timeout 60 iscsiadm -m node -T "$1" -p "$2" --logout || rc=$?
+    if [[ $rc -ne 0 && $rc -ne 21 ]]; then
+        echo "logout returned exit code ${rc}"
+    fi
+    iscsiadm -m node -T "$1" -p "$2" -o delete
+}
+
+u_login_screen_drop() {
+    rm -f /etc/profile.d/pbs-motd.sh /etc/cron.d/pbs-motd /etc/pbs-motd.conf /etc/apt/apt.conf.d/99pbs-motd \
+          /usr/local/bin/pbs-menu /usr/local/bin/pbs-help /usr/local/bin/pbs-motd /usr/local/sbin/pbs-motd
+    rm -rf /var/lib/pbs-motd
+    rm -f /var/log/pbs-motd-update.log /var/lock/pbs-motd-update.lock
+    if [[ -f /etc/motd.pbs-orig ]]; then
+        mv /etc/motd.pbs-orig /etc/motd
+    fi
+}
+
+u_popup_back() {  # take the popup hook away and restore the original web interface file
+    local js="/usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js"
+    rm -f /etc/apt/apt.conf.d/no-nag-script /etc/apt/apt.conf.d/99-pbs-no-nag /usr/local/bin/pbs-remove-nag.sh
+    if grep -qE 'NoMoreNagging|NO-NAG' "$js" 2>/dev/null; then
+        "${APT_ENV[@]}" apt-get "${APT_OPTS[@]}" --reinstall install proxmox-widget-toolkit
+        systemctl restart proxmox-backup-proxy
+    fi
+}
+
+run_uninstall() {
+    local -a scripts=() names=() mounts=() targets=() portals=() all_ds=()
+    local f s TARGET PORTAL MOUNT_PATH name ds_list ds busy n i confirm users tmp
+    local has_login=0 has_popup=0 has_installer=0 pbs_stopped=0 failed=0 stuck=0 BLINK="" tp seen=" "
+
+    if [[ $EUID -ne 0 ]]; then
+        echo "--uninstall needs root. Run:  sudo $0 --uninstall" >&2
+        return 2
+    fi
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        echo "--uninstall is interactive - run it in a terminal." >&2
+        return 2
+    fi
+    touch "$LOG_FILE"; chmod 600 "$LOG_FILE"
+    INSTALL_STARTED=1
+    echo "=== uninstall v${VERSION} started $(date '+%F %T') dry_run=${DRY_RUN}" >> "$LOG_FILE"
+
+    # ---- what is there?
+    for f in /usr/local/bin/check-iscsi-session-*.sh; do
+        if [[ -f "$f" ]]; then scripts+=("$f"); fi
+    done
+    for f in "${scripts[@]}"; do
+        TARGET=""; PORTAL=""; MOUNT_PATH=""
+        # shellcheck disable=SC1090
+        source <(grep -E '^(TARGET|PORTAL|MOUNT_PATH)=' "$f")
+        if [[ -z "$TARGET" || -z "$PORTAL" || -z "$MOUNT_PATH" ]]; then
+            warn "Could not read the drive details from ${f} - that drive is skipped."
+            continue
+        fi
+        names+=("$(basename "$MOUNT_PATH")"); mounts+=("$MOUNT_PATH"); targets+=("$TARGET"); portals+=("$PORTAL")
+    done
+    [[ -e /usr/local/sbin/pbs-motd || -e /etc/profile.d/pbs-motd.sh ]] && has_login=1
+    [[ -e /etc/apt/apt.conf.d/no-nag-script || -e /etc/apt/apt.conf.d/99-pbs-no-nag ]] && has_popup=1
+    [[ -e /usr/local/sbin/pbs-post-install.sh ]] && has_installer=1
+
+    printf '\033[2J\033[H'
+    if [[ ${#names[@]} -eq 0 && $has_login -eq 0 && $has_popup -eq 0 ]]; then
+        CURRENT_TASK="Uninstall"
+        render_banner
+        echo
+        info "Nothing set up by this installer was found - nothing to uninstall."
+        return 0
+    fi
+    if [[ -t 1 ]]; then BLINK=$'\033[5;1m'; fi
+
+    # ---- the red warning
+    echo
+    echo "  ${RED}${BLINK}█████  ⚠  W A R N I N G  ⚠  █████${NC}"
+    echo "  ${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "  ${CYAN}DRY RUN: nothing will be changed. This only shows what an uninstall would do.${NC}"
+    else
+        echo "  ${RED}${BLINK}THIS REMOVES EVERYTHING THE INSTALLER SET UP ON THIS SERVER${NC}"
+    fi
+    echo "  ${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo
+    echo "  ${WHITE}Your backups are NOT erased.${NC} They stay on the Synology LUN, and the LUN, the"
+    echo "  target and everything else on the Synology are not touched. The datastores are only"
+    echo "  taken off this Proxmox Backup Server's list, so PBS can no longer reach the backups"
+    echo "  until you set the drive up again."
+    echo
+
+    # ---- step by step
+    panel_top "What the uninstaller will do, in this order" "$RED"
+    n=1
+    for i in "${!names[@]}"; do
+        ds_list=$(datastores_on "${mounts[i]}" | paste -sd' ' - || true)
+        panel_line "${WHITE}Drive ${names[i]}${NC}  ${DIM}${mounts[i]} · ${targets[i]##*:}${NC}"
+        panel_line "  ${n}. remove the PBS datastore: ${ds_list:-${DIM}none${NC}} ${DIM}(backup files stay on the LUN)${NC}"
+        panel_line "  $(( n + 1 )). stop its monitor (cron job) and unmount ${mounts[i]}"
+        panel_line "  $(( n + 2 )). remove its /etc/fstab line ${DIM}(a copy is kept)${NC}, the empty mount folder and the boot-order file"
+        panel_line "  $(( n + 3 )). log out of the Synology target and delete its saved login on this server"
+        n=$(( n + 4 ))
+    done
+    if [[ $has_popup -eq 1 ]]; then
+        panel_line "${WHITE}Subscription popup${NC}"
+        panel_line "  ${n}. remove the popup hook and restore the original web interface file"
+        n=$(( n + 1 ))
+    fi
+    if [[ $has_login -eq 1 ]]; then
+        panel_line "${WHITE}Login screen${NC}"
+        panel_line "  ${n}. remove the dashboard and menu (pbs-motd, pbs-menu) and put the original /etc/motd back"
+        n=$(( n + 1 ))
+    fi
+    if [[ $has_installer -eq 1 ]]; then
+        panel_line "${WHITE}Installer${NC}"
+        panel_line "  ${n}. remove the installer copy /usr/local/sbin/pbs-post-install.sh ${DIM}(the log file stays)${NC}"
+    fi
+    panel_blank
+    panel_line "${WHITE}It will NOT:${NC} erase backups, change anything on the Synology, or remove the packages"
+    panel_line "(open-iscsi) and the PBS repository setting - other things on this server may use them."
+    panel_bottom
+    echo
+
+    # ---- safe right now?
+    for i in "${!names[@]}"; do
+        for ds in $(datastores_on "${mounts[i]}"); do
+            all_ds+=("$ds")
+            busy=$(running_tasks_for "$ds")
+            if [[ "$busy" == "?" ]]; then
+                warn "Could not ask PBS whether a backup is running on '${ds}'. Check the web UI (Administration › Tasks) first."
+            elif [[ "$busy" -gt 0 ]]; then
+                err "A task is running on datastore '${ds}' (backup, verify, garbage collection or sync). Wait for it to finish, then run this again. Nothing was changed."
+                return 1
+            fi
+        done
+    done
+
+    if [[ $DRY_RUN -eq 0 ]]; then
+        echo "  ${RED}${BLINK}⚠  After this, PBS cannot reach the backups on the Synology.${NC}"
+        ask_input confirm "Type UNINSTALL (capitals) to continue, or press Enter to cancel"
+        if [[ "$confirm" != "UNINSTALL" ]]; then
+            echo "  ${YELLOW}Cancelled - nothing was changed.${NC}"
+            return 0
+        fi
+    fi
+    echo
+
+    # ---- the drives
+    for i in "${!names[@]}"; do
+        name="${names[i]}"; MOUNT_PATH="${mounts[i]}"; TARGET="${targets[i]}"; PORTAL="${portals[i]}"
+        f="/usr/local/bin/check-iscsi-session-${name}.sh"
+        echo "  ${WHITE}Drive ${name}${NC}"
+        stuck=0
+        for ds in $(datastores_on "$MOUNT_PATH"); do
+            U "remove datastore '${ds}' from PBS (files stay on the LUN)" proxmox-backup-manager datastore remove "$ds"
+            if [[ $U_RC -ne 0 ]]; then
+                err "PBS could not remove '${ds}'. Stopped here - nothing else was changed for this drive. Log: ${LOG_FILE}"
+                stuck=1; failed=1
+            fi
+        done
+        if [[ $stuck -eq 1 ]]; then continue; fi
+        U "stop the monitor for ${name} (remove its cron job)" u_cron_drop "$name"
+        if [[ $DRY_RUN -eq 0 ]]; then
+            flock -w 30 "/run/lock/iscsi-monitor-${name}.lock" true 2>/dev/null || true
+        fi
+        if [[ $DRY_RUN -eq 1 ]]; then
+            U "unmount ${MOUNT_PATH}" true
+        elif mountpoint -q "$MOUNT_PATH"; then
+            sync
+            if ! umount "$MOUNT_PATH" >> "$LOG_FILE" 2>&1; then
+                warn "${MOUNT_PATH} is busy - something still uses it:"
+                users=$(fuser -vm "$MOUNT_PATH" 2>&1 | head -n 8 || true)
+                if [[ -n "$users" ]]; then
+                    while IFS= read -r tmp; do echo "    ${DIM}${tmp}${NC}"; done <<< "$users"
+                fi
+                info "Stopping PBS for a moment and trying again (it is started again at the end)."
+                systemctl stop proxmox-backup-proxy proxmox-backup >> "$LOG_FILE" 2>&1 || true
+                pbs_stopped=1
+                sleep 2
+                umount "$MOUNT_PATH" >> "$LOG_FILE" 2>&1 || true
+            fi
+            if mountpoint -q "$MOUNT_PATH"; then
+                u_cron_back "$name" "$f"
+                err "${MOUNT_PATH} is still mounted. This drive's mount, fstab line and iSCSI login are left as they are and its monitor runs again."
+                failed=1
+                continue
+            fi
+            ok "unmounted ${MOUNT_PATH}"
+        else
+            ok "${MOUNT_PATH} was not mounted"
+        fi
+        if awk -v p="$MOUNT_PATH" '!/^[[:space:]]*#/ && $2 == p { f = 1 } END { exit !f }' /etc/fstab; then
+            U "remove the /etc/fstab line for ${MOUNT_PATH} (copy: /etc/fstab.backup.*)" u_fstab_drop "$MOUNT_PATH"
+        fi
+        if [[ -d "$MOUNT_PATH" ]]; then
+            U "remove the empty mount folder ${MOUNT_PATH}" u_mountdir_drop "$MOUNT_PATH"
+        fi
+        U "remove the monitor files and the PBS boot-order file for ${name}" u_monitor_files_drop "$name" "$f"
+        tp="${TARGET}|${PORTAL}"
+        if [[ "$seen" != *" ${tp} "* ]]; then
+            seen+="${tp} "
+            U "log out of ${TARGET##*:} and delete its saved login on this server" u_iscsi_drop "$TARGET" "$PORTAL"
+            if [[ $U_RC -ne 0 ]]; then failed=1; fi
+        fi
+        echo
+    done
+    if [[ $DRY_RUN -eq 0 && ${#names[@]} -gt 0 ]]; then
+        systemctl daemon-reload >> "$LOG_FILE" 2>&1 || true
+    fi
+
+    # ---- popup, login screen, installer
+    if [[ $has_popup -eq 1 ]]; then
+        echo "  ${WHITE}Subscription popup${NC}"
+        U "remove the popup hook and restore the original web interface file" u_popup_back
+        if [[ $U_RC -ne 0 ]]; then failed=1; fi
+        echo
+    fi
+    if [[ $has_login -eq 1 ]]; then
+        echo "  ${WHITE}Login screen${NC}"
+        U "remove the dashboard and menu and put the original /etc/motd back" u_login_screen_drop
+        echo
+    fi
+    if [[ $pbs_stopped -eq 1 ]]; then
+        systemctl start proxmox-backup proxmox-backup-proxy >> "$LOG_FILE" 2>&1 || true
+        ok "PBS started again"
+    fi
+    if [[ $has_installer -eq 1 ]]; then
+        echo "  ${WHITE}Installer${NC}"
+        U "remove the installer copy /usr/local/sbin/pbs-post-install.sh" rm -f /usr/local/sbin/pbs-post-install.sh
+        echo
+    fi
+    echo "OK    uninstall finished dry_run=${DRY_RUN} failed=${failed}" >> "$LOG_FILE"
+
+    # ---- result
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "  ${CYAN}Dry run finished. Nothing was changed.${NC}  Run  ${WHITE}$0 --uninstall${NC}  to do it for real."
+        echo
+        return 0
+    fi
+    if [[ $failed -eq 0 ]]; then
+        echo "  ${GREEN}✔  Everything the installer set up is removed from this server.${NC}"
+    else
+        echo "  ${YELLOW}⚠  Uninstall finished, with the notes above. Run it again after you have fixed them.${NC}"
+    fi
+    echo
+    panel_top "Still to do by hand" "$GREEN"
+    panel_line "${WHITE}Proxmox VE${NC}   Datacenter › Storage: remove the storage entry that pointed to"
+    panel_line "              ${all_ds[*]:-this datastore}, and check your backup jobs."
+    panel_line "${WHITE}Synology${NC}     Nothing was changed there. Your backups are still on the LUN."
+    panel_line "              Only if you want the space back: SAN Manager › LUN › delete the LUN"
+    panel_line "              (this deletes the backups on it for good), then the target if it is unused."
+    panel_line "${DIM}To use the drive again later: run the installer again and choose to keep your data.${NC}"
+    panel_bottom
+    echo
+}
+
 usage() {
     cat <<EOF
 PBS Post-Install v${VERSION}
@@ -5774,6 +6214,9 @@ PBS Post-Install v${VERSION}
                                      target (Synology log: "CHAP required but absent")
   ./pbs-post-install.sh --add-drive  connect one more Synology LUN (own mount path, datastore, monitor)
   ./pbs-post-install.sh --remove-drive  take a drive away again (datastore, monitor, mount, iSCSI login)
+  ./pbs-post-install.sh --uninstall  remove everything this installer set up (backups on the Synology stay)
+  ./pbs-post-install.sh --dry-run    add to the installer, --add-drive, --remove-drive or --uninstall:
+                                     shows what would happen and changes nothing
   ./pbs-post-install.sh --motd       install / update only the login dashboard + menu
   ./pbs-post-install.sh --motd-remove  remove the login screen (restores /etc/motd)
   ./pbs-post-install.sh --motd-update  update login screen + installer copy, keep all settings
@@ -5787,12 +6230,28 @@ EOF
 # MAIN
 # ===========================================================================
 main() {
-    local rc=0
+    local rc=0 a
+    local -a rest=()
+    for a in "$@"; do
+        if [[ "$a" == "--dry-run" ]]; then DRY_RUN=1; else rest+=("$a"); fi
+    done
+    set -- "${rest[@]}"
+    if [[ $DRY_RUN -eq 1 ]]; then
+        case "${1:-}" in
+            ""|--add-drive|--remove-drive|--uninstall) ;;
+            *) echo "--dry-run works with: (no option), --add-drive, --remove-drive and --uninstall" >&2; exit 2 ;;
+        esac
+        echo "DRY RUN: nothing on this server will be changed." >&2
+    fi
     case "${1:-}" in
         "") ;;
         --add-drive) ADD_DRIVE=1 ;;
         --remove-drive)
             run_remove_drive || rc=$?
+            exit "$rc"
+            ;;
+        --uninstall)
+            run_uninstall || rc=$?
             exit "$rc"
             ;;
         --status|-s)
