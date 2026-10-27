@@ -8,7 +8,7 @@
 
 *Plain shell menus · CHAP · ext4 or XFS · keeps your data · repairs itself · live login dashboard · one-key self-update*
 
-![version](https://img.shields.io/badge/version-1.12.5-2f81f7?style=for-the-badge)
+![version](https://img.shields.io/badge/version-1.12.6-2f81f7?style=for-the-badge)
 ![debian](https://img.shields.io/badge/Debian-13%20trixie-d70a53?style=for-the-badge&logo=debian&logoColor=white)
 ![pbs](https://img.shields.io/badge/Proxmox%20Backup%20Server-4.x-e57000?style=for-the-badge)
 ![bash](https://img.shields.io/badge/Bash-5.x-4eaa25?style=for-the-badge&logo=gnubash&logoColor=white)
@@ -97,7 +97,7 @@ This script walks you through the whole setup with questions first and changes s
    ██████╔╝██████╔╝███████╗   Proxmox Backup Server  4.2.8
    ██╔═══╝ ██╔══██╗╚════██║   iSCSI storage on Synology
    ██║     ██████╔╝███████║   ● ALL SYSTEMS HEALTHY
-   ╚═╝     ╚═════╝ ╚══════╝   pbs-motd v1.12.5 · by MorphyDK
+   ╚═╝     ╚═════╝ ╚══════╝   pbs-motd v1.12.6 · by MorphyDK
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   ╭─ Server
@@ -107,7 +107,7 @@ This script walks you through the whole setup with questions first and changes s
   │ System disk    ████░░░░░░░░░░░░░░░░░░░░  17%  4.8GB of 28GB
   │ Updates        ✔ up to date (checked 5h ago)
   │ Reboot         (shown in red when a newer kernel is installed than the one running)
-  │ Installer      ✔ v1.12.5 · newest version (checked 3h ago)
+  │ Installer      ✔ v1.12.6 · newest version (checked 3h ago)
   ╰─
 
   ╭─ iSCSI storage · /mnt/synology
@@ -299,7 +299,7 @@ In the **live dashboard** a key bar at the bottom shows what you can do: `m` men
    ██████╗ ██████╗ ███████╗   pbs  192.168.0.57
    ██╔══██╗██╔══██╗██╔════╝   Proxmox Backup Server  4.2.8
    ██████╔╝██████╔╝███████╗   ● ALL SYSTEMS HEALTHY
-   ╚═╝     ╚═════╝ ╚══════╝   pbs-motd v1.12.5 · by MorphyDK
+   ╚═╝     ╚═════╝ ╚══════╝   pbs-motd v1.12.6 · by MorphyDK
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   ▄▄▄  synology-Thick  thick · ext4 · 20GB   ● connected
   █●█  █░░░░░░░░░░░░░░░░░░░░░░░░░░░   1%  20GB free
@@ -607,7 +607,7 @@ The datastore itself is removed in the PBS web UI (Datastore › Remove). That d
 
 **Not yet verified on real hardware:** what happens through a full DSM update/reboot with a backup running, the automatic repair after a long outage, and XFS on very large LUNs. **Please test restores before you rely on any backup setup**, and open an issue if something behaves differently on your system.
 
-`shellcheck` is clean on v1.10.2 and later for the installer and the generated login screen (`pbs-motd`). The monitor script of a drive set up with an older version keeps its old text (one harmless note about an unused loop variable) until you run the installer for that drive again.
+`shellcheck` (0.10.0) is clean on v1.12.5 for the installer and the generated login screen (`pbs-motd`), checked by the author on a real server. From v1.12.6 the generated monitor script is clean too. The monitor script of a drive set up with an older version keeps its old text (two harmless SC2034 notes about unused variables) until you set that drive up again. To fix it right away: `sed -i -e 's/local now last i$/local now last/' -e 's/^    for i in \$(seq 1 "\$WRITE_TEST_SECS"); do/    for _ in $(seq 1 "$WRITE_TEST_SECS"); do/' /usr/local/bin/check-iscsi-session-*.sh`
 
 ---
 

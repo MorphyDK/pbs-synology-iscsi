@@ -7,7 +7,7 @@
 # 
 # Thanks to Derek Seaman's Tech Blog who inspired me to make this.
 #
-# Version 1.12.5  27/10-2026
+# Version 1.12.6  27/10-2026
 # Author MorphyDK
 #
 # Usage:  ./pbs-post-install.sh              interactive installer
@@ -21,6 +21,11 @@
 #         ./pbs-post-install.sh --motd-remove  remove the login screen again
 #         ./pbs-post-install.sh --motd-update  silent update of the login screen, keeps settings
 #         ./pbs-post-install.sh --help
+#
+# Changes in 1.12.6:
+#  - ShellCheck: the generated monitor script no longer has two unused variables (SC2034).
+#    No change in behaviour. Drives set up earlier keep the old text until you set them up again
+#    (harmless), or fix it with the two sed lines in the README
 #
 # Changes in 1.12.5:
 #  - The LUN list (when a target holds several LUNs) is clearer: free LUNs first, LUNs that are
@@ -220,7 +225,7 @@
 set -eE
 export LC_ALL=C.UTF-8
 
-VERSION="1.12.5"
+VERSION="1.12.6"
 LOG_FILE="/var/log/pbs-post-install.log"
 FS_LABEL="pbs-data"
 FOUR_TIB=4398046511104
@@ -2843,10 +2848,10 @@ mount_is_readonly() {
 # Creates, syncs and removes a small file on the LUN.
 # 0 = ok, 2 = the write failed, 3 = no answer within WRITE_TEST_SECS
 write_test() {
-    local f="$MOUNT_PATH/.pbs-monitor-test" pid i
+    local f="$MOUNT_PATH/.pbs-monitor-test" pid
     ( : > "$f" && sync -d "$f" && rm -f "$f" ) 2>/dev/null &
     pid=$!
-    for i in $(seq 1 "$WRITE_TEST_SECS"); do
+    for _ in $(seq 1 "$WRITE_TEST_SECS"); do
         if ! kill -0 "$pid" 2>/dev/null; then
             break
         fi
@@ -2886,7 +2891,7 @@ check_health() {
 }
 
 repair() {
-    local now last i
+    local now last
     now=$(date +%s)
     last=$(cat "${STATE_FILE}.repair" 2>/dev/null || echo 0)
     if [ $(( now - last )) -lt "$REPAIR_COOLDOWN" ]; then
