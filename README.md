@@ -15,6 +15,10 @@
 ![synology](https://img.shields.io/badge/Synology-iSCSI%20%2B%20CHAP-b5b5b5?style=for-the-badge)
 ![license](https://img.shields.io/badge/license-MIT-yellow?style=for-the-badge)
 
+<img src="demo.gif" alt="Demo of the pbs-menu: dashboard, Drives submenu" width="760">
+
+<sub>Demo with simulated data (example IP and drive names), not a real server.</sub>
+
 [Why](#why-this-exists) · [Features](#features) · [Quick start](#quick-start) · [Synology guide](#step-1--prepare-the-synology) · [The installer](#what-the-installer-does) · [Login screen](#the-login-screen) · [Commands](#command-reference) · [Troubleshooting](#troubleshooting) · [FAQ](#faq)
 
 </div>
